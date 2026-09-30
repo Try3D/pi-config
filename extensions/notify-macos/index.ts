@@ -1,11 +1,11 @@
 /**
  * macOS notifications for pi.
- * - agent_settled -> "finished" (fires only when pi will not continue automatically)
- * - ui_prompt_start -> "needs attention" (blocking prompt appeared)
+ * - agent_settled: "finished" when pi will not continue automatically
+ * - ui_prompt_start: "needs attention" when a blocking prompt appears
  *
  * Title uses the project folder name so you know which window finished.
- * Only interactive sessions (tui/rpc) notify: headless SDK/print runs also load
- * this extension, which caused spurious notifications from scripts like
+ * Only interactive sessions (tui/rpc) notify. Headless SDK/print runs also load
+ * this extension, and those produced spurious notifications from scripts like
  * pibox/scripts/test-drive.ts.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -15,11 +15,13 @@ import { basename } from "node:path";
 export default function (pi: ExtensionAPI) {
 	if (process.platform !== "darwin") return;
 
+	// Text is passed as argv, not interpolated into the script: model output can
+	// contain quotes/backslashes and must never be parsed as AppleScript.
+	const NOTIFY_SCRIPT = 'on run argv\ndisplay notification (item 1 of argv) with title (item 2 of argv) sound name "Sosumi"\nend run';
 	const notify = (title: string, body: string) =>
-		execFile("osascript", [
-			"-e",
-			`display notification ${JSON.stringify(body)} with title ${JSON.stringify(title)} sound name "Sosumi"`,
-		]);
+		// Ignored callback. Swallow osascript errors so an emitted `error` event
+		// never crashes the pi session.
+		execFile("osascript", ["-e", NOTIFY_SCRIPT, "--", body, title], () => {});
 
 	// agent_settled carries no payload, so remember the last stop reason from
 	// agent_end and skip notifying when the run was interrupted (Esc). Also
@@ -32,7 +34,7 @@ export default function (pi: ExtensionAPI) {
 		lastText = undefined;
 		for (let i = event.messages.length - 1; i >= 0; i--) {
 			const message = event.messages[i];
-			if (message.role !== "assistant") continue;
+			if (!message || message.role !== "assistant") continue;
 			stopReason = message.stopReason;
 			lastText = message.content
 				.filter((part) => part.type === "text")

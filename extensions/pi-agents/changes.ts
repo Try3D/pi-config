@@ -7,7 +7,7 @@ import { execFile } from "node:child_process";
 function git(cwd: string, args: string[]): Promise<string> {
 	return new Promise((resolve, reject) => {
 		execFile("git", ["-C", cwd, ...args], { encoding: "utf-8" }, (error, stdout) => {
-			if (error) reject(error);
+			if (error) reject(error instanceof Error ? error : new Error("git command failed"));
 			else resolve(stdout);
 		});
 	});
@@ -26,6 +26,7 @@ export async function gitSummary(cwd: string): Promise<string> {
 	}
 	if (!status.trim()) return "none";
 
-	const stat = await git(cwd, ["diff", "--stat"]).catch(() => "");
+	// `diff HEAD` so staged changes get line counts too (plain `diff` only shows unstaged).
+	const stat = await git(cwd, ["diff", "HEAD", "--stat"]).catch(() => git(cwd, ["diff", "--stat"]).catch(() => ""));
 	return [status.trim(), stat.trim()].filter(Boolean).join("\n");
 }

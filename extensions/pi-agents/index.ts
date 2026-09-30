@@ -1,5 +1,5 @@
 /**
- * pi-agents — tmux-native subagents for pi.
+ * pi-agents: tmux-native subagents for pi.
  *
  * - `subagent` tool: the LLM can delegate a task to a named agent.
  * - `/agent:<name> <task>` commands: the human can directly run a named agent.
@@ -7,51 +7,21 @@
  * Each subagent runs a separate `pi` session in a tiled tmux pane of the
  * current session (4 panes per tab). The parent collects the final text and a
  * git change summary.
+ *
+ * Module split: agents.ts (agent discovery), script.ts (run.sh generation),
+ * jsonl.ts (raw.jsonl parsing), tmux.ts (pane allocation), changes.ts (git
+ * summary), run.ts (subagent lifecycle), commands.ts (/agent:<name> commands),
+ * index.ts (tool registration + wiring).
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { discoverAgents, type AgentConfig, type AgentScope } from "./agents.ts";
-import { runSubagent, type RunResult } from "./run.ts";
+import { discoverAgents } from "./agents.ts";
+import { abortActiveRuns, failureText, registerAgentCommands, resultText, scopeFor } from "./commands.ts";
+import { runSubagent } from "./run.ts";
 
-function scopeFor(ctx: { isProjectTrusted(): boolean }): AgentScope {
-	return ctx.isProjectTrusted() ? "both" : "user";
-}
-
-function resultText(result: RunResult): string {
-	const sections: string[] = [];
-	if (result.text.trim()) sections.push(result.text.trim());
-	if (result.changes) sections.push(`Changed files:\n${result.changes}`);
-	return sections.join("\n\n") || "(no output)";
-}
-
-async function executeAgent(
-	pi: ExtensionAPI,
-	agent: AgentConfig,
-	task: string,
-	ctx: Parameters<typeof runSubagent>[0]["ctx"],
-): Promise<RunResult> {
-	if (ctx.hasUI) ctx.ui.setStatus("pi-agents", `Running ${agent.name}...`);
-	try {
-		const result = await runSubagent({ ctx, agent, task });
-		if (result.timedOut) throw new Error(`Subagent "${agent.name}" timed out (pane ${result.paneId}).`);
-		if (result.exitCode !== 0) {
-			throw new Error(`Subagent "${agent.name}" exited with code ${result.exitCode} (pane ${result.paneId}).`);
-		}
-		pi.sendMessage(
-			{
-				customType: "pi-agents",
-				content: `**${agent.name}** (${agent.source})\n\n${resultText(result)}`,
-				display: true,
-				details: { agent: agent.name, paneId: result.paneId, changes: result.changes },
-			},
-			{ deliverAs: "followUp", triggerTurn: false },
-		);
-		return result;
-	} finally {
-		if (ctx.hasUI) ctx.ui.setStatus("pi-agents", undefined);
-	}
-}
+/** Commands can only be registered once per process, since pi suffixes duplicates. */
+let commandsRegistered = false;
 
 export default function (pi: ExtensionAPI) {
 	// LLM-facing tool
@@ -82,7 +52,7 @@ export default function (pi: ExtensionAPI) {
 				ctx,
 				agent,
 				task: params.task,
-				cwd: params.cwd ? params.cwd : undefined,
+				cwd: params.cwd,
 				signal,
 				onUpdate: (text) => {
 					onUpdate?.({
@@ -92,10 +62,7 @@ export default function (pi: ExtensionAPI) {
 				},
 			});
 
-			if (result.timedOut) throw new Error(`Subagent "${agent.name}" timed out (pane ${result.paneId}).`);
-			if (result.exitCode !== 0) {
-				throw new Error(`Subagent "${agent.name}" exited with code ${result.exitCode} (pane ${result.paneId}).`);
-			}
+			if (result.timedOut || result.exitCode !== 0) throw new Error(failureText(agent, result));
 
 			return {
 				content: [{ type: "text", text: resultText(result) }],
@@ -112,40 +79,14 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Human-facing commands: /agent:<name> <task>
-	pi.on("session_start", async (_event, ctx) => {
-		const agents = discoverAgents(ctx.cwd, scopeFor(ctx));
+	pi.on("session_start", (_event, ctx) => {
+		if (commandsRegistered) return;
+		commandsRegistered = true;
+		registerAgentCommands(pi, ctx);
+	});
 
-		pi.registerCommand("agents", {
-			description: "List available subagents",
-			handler: async (_args, cmdCtx) => {
-				const list = discoverAgents(cmdCtx.cwd, scopeFor(cmdCtx));
-				const text =
-					list.map((a) => `/${"agent:"}${a.name} — ${a.description}`).join("\n") || "No agents found.";
-				cmdCtx.ui.notify(text, "info");
-			},
-		});
-
-		for (const agent of agents) {
-			pi.registerCommand(`agent:${agent.name}`, {
-				description: `Run the ${agent.name} subagent: ${agent.description}`,
-				handler: async (args, cmdCtx) => {
-					let task = args.trim();
-					if (!task) {
-						if (!cmdCtx.hasUI) {
-							cmdCtx.ui.notify(`Usage: /agent:${agent.name} <task>`, "error");
-							return;
-						}
-						const input = await cmdCtx.ui.input(`Task for ${agent.name}:`, "");
-						if (!input?.trim()) return;
-						task = input.trim();
-					}
-					try {
-						await executeAgent(pi, agent, task, cmdCtx);
-					} catch (error) {
-						cmdCtx.ui.notify(error instanceof Error ? error.message : String(error), "error");
-					}
-				},
-			});
-		}
+	// Abort command-triggered runs that are still waiting when the session exits.
+	pi.on("session_shutdown", () => {
+		abortActiveRuns();
 	});
 }

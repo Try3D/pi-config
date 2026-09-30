@@ -1,18 +1,18 @@
 /**
- * Sidebar — a docked info panel that reflows the transcript instead of covering it.
+ * Sidebar: a docked info panel that reflows the transcript instead of covering it.
  *
  * Pi's regular TUI has no sidebar region, so in fullscreen mode this wraps the
  * renderer's layout root in an `HStack`:
  *
  *     HStack[ original VStack (transcript + dock) | Sidebar ]
  *
- * That gives a real docked column: the transcript, editor, and footer shrink to
+ * That gives a docked column: the transcript, editor, and footer shrink to
  * the remaining width and nothing is hidden. In regular mode there is no layout
- * engine, so it falls back to a non-capturing full-height overlay (which does
- * cover content — switch to fullscreen mode to avoid that).
+ * engine, so it falls back to a non-capturing full-height overlay that does
+ * cover content. Switch to fullscreen mode to avoid that.
  *
  * The layout root is a private field on the renderer (`layoutRoot`), read and
- * restored here. This is version-fragile: if a future pi renames it, the
+ * restored here. This is version-fragile, so if a future pi renames it, the
  * extension degrades to the overlay path.
  *
  * `/sidebar`            toggle visibility
@@ -25,256 +25,60 @@
  * pane (only when running inside tmux).
  *
  * Session labels come from the session's name when set (see the separate
- * `title.ts` extension, which names sessions with a small model) and fall back
+ * `title` extension, which names sessions with a small model) and fall back
  * to the session's first user message.
  *
  * Each process publishes its own status to `~/.pi/agent/sidebar/<pid>.json`
  * (label, cwd, model, branch, tmux pane). Every sidebar watches that directory,
  * so a change anywhere (a title, a model switch, a new pane) live-updates all
- * running sidebars; ps remains the source of truth for which pids exist.
+ * running sidebars; ps decides which pids exist.
+ *
+ * Module split: types.ts (constants + shared types), format.ts (pure
+ * formatting/parsing), component.ts (the panel TUI component), footer.ts
+ * (session-name-quiet footer), index.ts (lifecycle, discovery, commands).
  */
 
 import {
-	FooterComponent,
 	SessionManager,
 	type ExtensionAPI,
 	type ExtensionContext,
-	type ReadonlyFooterDataProvider,
 	type SessionInfo,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
-import type { Component, OverlayHandle, OverlayOptions, StackEntry, TUI, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { HStack, isViewportTUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { Component, OverlayHandle, OverlayOptions, StackEntry, TUI } from "@earendil-works/pi-tui";
+import { HStack, isViewportTUI } from "@earendil-works/pi-tui";
 import { watch, type FSWatcher } from "node:fs";
 import { mkdir, readFile, readdir, readlink, unlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
-
-const SHARED_DIR = join(process.env.PI_CODING_AGENT_DIR?.trim() || join(process.env.HOME ?? ".", ".pi", "agent"), "sidebar");
-const WIDTH = 34;
-const MIN_TERMINAL_WIDTH = 100;
-const MAX_PROCESSES = 12;
-const PROCESS_REFRESH_MS = 5000;
-
-type Side = "left" | "right";
-
-interface TmuxTarget {
-	session: string;
-	window: string;
-	pane: string;
-	name?: string;
-}
-
-interface ProcessItem {
-	pid: number;
-	label: string;
-	version?: string;
-	elapsed: string;
-	current: boolean;
-	cwd?: string;
-	tmux?: TmuxTarget;
-}
-
-/** Per-process status published to disk so every sidebar sees every pi exactly as it sees itself. */
-interface SharedStatus {
-	pid: number;
-	label?: string;
-	cwd?: string;
-	model?: string;
-	thinking?: string;
-	branch?: string;
-	pane?: string;
-	updatedAt: number;
-}
-
-interface SidebarState {
-	model: string;
-	thinking: string;
-	cwd: string;
-	branch?: string;
-	tokens: number | null;
-	contextWindow?: number;
-	percent: number | null;
-	turns: number;
-	streaming: boolean;
-	processes: ProcessItem[];
-}
-
-function homePath(cwd: string): string {
-	const home = process.env.HOME;
-	return home && cwd.startsWith(home) ? `~${cwd.slice(home.length)}` : cwd;
-}
-
-/** Compact an `etime` value ([[dd-]hh:]mm:ss) into `6d 19h`, `2h 29m`, or `5m`. */
-function shortElapsed(etime: string): string {
-	const match = etime.match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):\d+$/);
-	if (!match) return etime;
-	const [, days, hours, minutes] = match;
-	if (days) return `${days}d ${hours ?? "0"}h`;
-	if (hours) return `${hours}h ${minutes}m`;
-	return `${minutes}m`;
-}
-
-/** Parse a ps `etime` value into elapsed milliseconds. */
-function elapsedMs(etime: string): number {
-	const match = etime.match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
-	if (!match) return 0;
-	const [, days, hours, minutes, seconds] = match;
-	return (((Number(days ?? 0) * 24 + Number(hours ?? 0)) * 60 + Number(minutes)) * 60 + Number(seconds)) * 1000;
-}
-
-/** Session name embedded in the pi terminal title (`pi - name - cwd`). */
-function titleSessionName(title: string): string | undefined {
-	const parts = title.split(" - ");
-	return parts.length >= 3 ? parts.slice(1, -1).join(" - ") : undefined;
-}
-
-/** The session a process is most plausibly running: pane-title name match, else most recently created before start. */
-function pickSessionInfo(sessions: SessionInfo[], startMs: number, paneName?: string): SessionInfo | undefined {
-	if (sessions.length === 0) return undefined;
-	if (paneName) {
-		const named = sessions.find((session) => session.name === paneName);
-		if (named) return named;
-	}
-	const prior = sessions.filter((session) => session.created.getTime() <= startMs + 2000);
-	const pool = prior.length > 0 ? prior : sessions;
-	return pool.reduce((a, b) => (b.created.getTime() > a.created.getTime() ? b : a));
-}
-
-/** Extract the pi install root from an open path under the pi package. */
-function piRoot(path: string): string | undefined {
-	for (const marker of ["/@earendil-works/pi-coding-agent", "/@mariozechner/pi-coding-agent"]) {
-		const index = path.indexOf(marker);
-		if (index !== -1) return path.slice(0, index + marker.length);
-	}
-	return undefined;
-}
-
-function contextBar(theme: Theme, state: SidebarState, cellBudget: number): string {
-	if (state.percent === null) return theme.fg("dim", "?");
-	const cells = Math.max(4, Math.min(12, cellBudget));
-	const filled = Math.round((state.percent / 100) * cells);
-	const color = state.percent >= 85 ? "error" : state.percent >= 65 ? "warning" : "success";
-	const window = state.contextWindow ? ` ${(state.contextWindow / 1000).toFixed(0)}k` : "";
-	return theme.fg(color, "█".repeat(filled) + "░".repeat(cells - filled)) + theme.fg("dim", ` ${Math.round(state.percent)}%${window}`);
-}
-
-class SidebarComponent implements Component {
-	private rowPids = new Map<number, number>();
-
-	constructor(
-		private readonly state: () => SidebarState,
-		private readonly theme: () => Theme,
-		private readonly height: () => number,
-		private readonly side: () => Side,
-		private readonly onSelect?: (pid: number) => void,
-	) {}
-
-	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
-		const pid = this.rowPids.get(event.y);
-		if (event.button !== "left" || pid === undefined) return undefined;
-		if (!this.state().processes.find((item) => item.pid === pid)?.tmux) return undefined;
-		if (event.type === "press") return { handled: true };
-		if (event.type === "click") {
-			this.onSelect?.(pid);
-			return { handled: true };
-		}
-		return undefined;
-	}
-
-	render(width: number): string[] {
-		if (width < 2) return [];
-		const theme = this.theme();
-		const state = this.state();
-		const inner = Math.max(0, width - 1);
-		const total = Math.max(1, this.height());
-
-		const pad = (line: string) => line + " ".repeat(Math.max(0, inner - visibleWidth(line)));
-		const row = (line: string) => {
-			// Reserve one column so a truncation ellipsis never touches the border.
-			const content = pad(truncateToWidth(line, Math.max(0, inner - 1), "…"));
-			// Border faces the transcript: left edge when docked right, right edge when docked left.
-			return this.side() === "left" ? content + theme.fg("border", "│") : theme.fg("border", "│") + content;
-		};
-		const label = (text: string) => theme.fg("muted", text.padEnd(9));
-		const value = (text: string) => theme.fg("text", text);
-		const empty = () => row("");
-
-		const upper = [
-			row(" " + label("Model") + value(state.model)),
-			row(" " + label("Thinking") + value(state.thinking)),
-			empty(),
-			row(" " + label("Dir") + value(homePath(state.cwd))),
-			row(" " + label("Branch") + value(state.branch ?? "—")),
-			empty(),
-		];
-		this.rowPids = new Map();
-		if (state.processes.length === 0) {
-			upper.push(row(" " + theme.fg("dim", "(no pi processes)")));
-		}
-		// Group by workspace; stable order (workspace, then pid) across windows.
-		const groups = new Map<string, ProcessItem[]>();
-		for (const item of state.processes) {
-			const bucket = groups.get(item.cwd ?? "");
-			if (bucket) bucket.push(item);
-			else groups.set(item.cwd ?? "", [item]);
-		}
-		const ordered = [...groups.entries()].sort(([a], [b]) => (a || "\uffff").localeCompare(b || "\uffff"));
-		for (const [workspace, items] of ordered) {
-			const title = workspace ? basename(workspace) : "unknown";
-			upper.push(row(" " + theme.fg("muted", `${title} (${items.length})`)));
-			for (const item of items) {
-				const marker = item.current ? theme.fg("accent", "▸") : theme.fg("dim", "·");
-				const name = item.current ? theme.fg("accent", item.label) : theme.fg("text", item.label);
-				const meta = [item.version && `v${item.version}`, item.elapsed].filter((part): part is string => Boolean(part)).join(" · ");
-				this.rowPids.set(upper.length, item.pid);
-				upper.push(row(" " + marker + " " + name + " " + theme.fg("dim", meta)));
-			}
-			upper.push(empty());
-		}
-		upper.push(
-			empty(),
-			row(" " + label("Context") + contextBar(theme, state, inner - 10)),
-			row(" " + label("Turns") + value(String(state.turns))),
-		);
-
-		const jumpHint = state.processes.some((item) => item.tmux);
-		const footer = [
-			empty(),
-			row(" " + (state.streaming ? theme.fg("accent", "▶ working…") : theme.fg("dim", "idle"))),
-			row(" " + theme.fg("dim", jumpHint ? "click a process to jump" : "ctrl+shift+s to hide")),
-		];
-
-		const filler = Math.max(0, total - upper.length - footer.length);
-		const body =
-			filler > 0 ? [...upper, ...Array.from({ length: filler }, empty), ...footer] : [...upper, ...footer].slice(0, total);
-
-		return body;
-	}
-
-	invalidate(): void {}
-}
-
-/**
- * pi's stock footer with the `• <session name>` suffix suppressed: the session
- * title is redundant there because tmux already names the window from the
- * terminal title. Everything else (branch, token stats, context, model) is the
- * real built-in footer reading live state through the stub session.
- */
-class QuietFooter extends FooterComponent {
-	constructor(footerData: ReadonlyFooterDataProvider, stub: unknown) {
-		super(stub as never, footerData);
-	}
-
-	/** Ignore pi swapping in the real session, which would re-add the name. */
-	override setSession(): void {}
-}
+import {
+	elapsedMs,
+	piRoot,
+	pickSessionInfo,
+	processLabelFallback,
+	sanitize,
+	shortElapsed,
+	titleSessionName,
+} from "./format.ts";
+import { QuietFooter } from "./footer.ts";
+import { SidebarComponent } from "./component.ts";
+import {
+	MAX_PROCESSES,
+	MIN_TERMINAL_WIDTH,
+	PROCESS_REFRESH_MS,
+	SHARED_DIR,
+	WIDTH,
+	type ProcessItem,
+	type SharedStatus,
+	type SidebarState,
+	type Side,
+	type TmuxTarget,
+} from "./types.ts";
 
 export default function (pi: ExtensionAPI) {
 	const state: SidebarState = {
 		model: "—",
 		thinking: "—",
 		cwd: "",
-		tokens: null,
 		percent: null,
 		turns: 0,
 		streaming: false,
@@ -292,7 +96,7 @@ export default function (pi: ExtensionAPI) {
 	let side: Side = "left";
 	let visible = true;
 
-	const theme = (): Theme => (lastTheme = ctx?.ui.theme ?? lastTheme!);
+	const theme = (): Theme | undefined => (lastTheme = ctx?.ui.theme ?? lastTheme);
 	const height = () => tui?.terminal.rows ?? process.stdout.rows ?? 24;
 
 	/** Jump tmux to the pane running the given pi process. */
@@ -336,8 +140,8 @@ export default function (pi: ExtensionAPI) {
 
 	/**
 	 * Reconcile the sidebar with the current renderer:
-	 * - fullscreen -> wrap/restore the layout root (true docked column)
-	 * - regular    -> full-height non-capturing overlay
+	 * - fullscreen: wrap or restore the layout root (true docked column)
+	 * - regular: full-height non-capturing overlay
 	 */
 	const reconcile = () => {
 		if (!tui) return;
@@ -347,12 +151,18 @@ export default function (pi: ExtensionAPI) {
 				overlay.hide();
 				overlay = undefined;
 			}
-			const current = (tui as unknown as { layoutRoot?: Component }).layoutRoot;
-			if (current && current !== wrapped && current !== originalRoot) {
-				// New renderer, or someone else replaced the root: adopt it.
-				originalRoot = current;
-				wrapped = undefined;
+			const viewport = tui as unknown as { layoutRoot?: Component };
+			// The layout root is private API; if it is gone, fall back to the overlay
+			// instead of silently rendering nothing.
+			if (!("layoutRoot" in viewport)) {
+				if (visible) showOverlay();
+				return;
 			}
+			const current = viewport.layoutRoot;
+			// Adopt the root once. If someone else replaced it, do not re-wrap their
+			// wrapper (that nests HStacks forever); leave it alone.
+			if (!originalRoot && current) originalRoot = current;
+			if (current && current !== wrapped && current !== originalRoot) return;
 			if (!originalRoot) return;
 			if (!wrapped || wrappedSide !== side) {
 				wrapped = buildWrapped(originalRoot);
@@ -376,18 +186,27 @@ export default function (pi: ExtensionAPI) {
 
 	const refresh = () => {
 		reconcile();
-		tui?.requestRender();
+		try {
+			tui?.requestRender();
+		} catch {
+			// The renderer was replaced or is gone; re-grab it on next use.
+			tui = undefined;
+			originalRoot = undefined;
+			wrapped = undefined;
+			wrappedSide = undefined;
+		}
 		void publishSelf();
 	};
 
 	let timer: ReturnType<typeof setInterval> | undefined;
+	/** Set by session_shutdown so in-flight async work cannot resurrect state. */
+	let shuttingDown = false;
 
 	const syncData = (source: ExtensionContext) => {
 		const usage = source.getContextUsage();
 		state.model = source.model?.id ?? "—";
 		state.thinking = pi.getThinkingLevel();
 		state.cwd = source.cwd;
-		state.tokens = usage?.tokens ?? null;
 		state.percent = usage?.percent ?? null;
 		state.contextWindow = usage?.contextWindow;
 	};
@@ -399,6 +218,7 @@ export default function (pi: ExtensionAPI) {
 
 	/** Publish this process's own status; other sidebars watch the directory and merge it in. */
 	const publishSelf = async (): Promise<void> => {
+		if (shuttingDown) return;
 		const signature = [
 			state.cwd,
 			pi.getSessionName() ?? "",
@@ -409,7 +229,7 @@ export default function (pi: ExtensionAPI) {
 		].join("\u0000");
 		if (signature === publishedSignature) return;
 		try {
-			await mkdir(SHARED_DIR, { recursive: true });
+			await mkdir(SHARED_DIR, { recursive: true, mode: 0o700 });
 			const status: SharedStatus = {
 				pid: process.pid,
 				label: pi.getSessionName(),
@@ -420,7 +240,7 @@ export default function (pi: ExtensionAPI) {
 				pane: process.env.TMUX_PANE,
 				updatedAt: Date.now(),
 			};
-			await writeFile(ownFile, `${JSON.stringify(status)}\n`);
+			await writeFile(ownFile, `${JSON.stringify(status)}\n`, { mode: 0o600 });
 			publishedSignature = signature;
 		} catch {
 			/* best-effort */
@@ -430,18 +250,35 @@ export default function (pi: ExtensionAPI) {
 	/** Every process's published status, including our own. */
 	const readShared = async (): Promise<Map<number, SharedStatus>> => {
 		const statuses = new Map<number, SharedStatus>();
+		let entries: import("node:fs").Dirent[];
 		try {
-			for (const name of await readdir(SHARED_DIR)) {
-				if (!name.endsWith(".json")) continue;
-				try {
-					const status = JSON.parse(await readFile(join(SHARED_DIR, name), "utf8")) as SharedStatus;
-					if (Number.isFinite(status.pid)) statuses.set(status.pid, status);
-				} catch {
-					/* skip malformed */
-				}
-			}
+			entries = await readdir(SHARED_DIR, { withFileTypes: true });
 		} catch {
-			/* directory does not exist yet */
+			return statuses; // directory does not exist yet
+		}
+		for (const entry of entries) {
+			// Regular files only: a planted symlink must not be followed.
+			if (!entry.name.endsWith(".json") || !entry.isFile()) continue;
+			let raw: unknown;
+			try {
+				raw = JSON.parse(await readFile(join(SHARED_DIR, entry.name), "utf8"));
+			} catch {
+				continue; // skip malformed
+			}
+			// Published by another process: validate instead of trusting the shape.
+			const status = raw as Partial<SharedStatus>;
+			if (typeof status?.pid !== "number" || !Number.isFinite(status.pid)) continue;
+			const str = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
+			statuses.set(status.pid, {
+				pid: status.pid,
+				label: str(status.label),
+				cwd: str(status.cwd),
+				model: str(status.model),
+				thinking: str(status.thinking),
+				branch: str(status.branch),
+				pane: str(status.pane),
+				updatedAt: typeof status.updatedAt === "number" ? status.updatedAt : 0,
+			});
 		}
 		return statuses;
 	};
@@ -450,10 +287,16 @@ export default function (pi: ExtensionAPI) {
 	const startWatching = async (): Promise<void> => {
 		if (watcher) return;
 		try {
-			await mkdir(SHARED_DIR, { recursive: true });
+			await mkdir(SHARED_DIR, { recursive: true, mode: 0o700 });
 			watcher = watch(SHARED_DIR, { persistent: false }, () => {
+				if (shuttingDown) return;
 				if (watchDebounce) clearTimeout(watchDebounce);
 				watchDebounce = setTimeout(() => void loadProcesses(), 150);
+			});
+			// A deleted/replaced directory emits 'error'; unhandled it would throw.
+			watcher.on("error", () => {
+				watcher?.close();
+				watcher = undefined;
 			});
 		} catch {
 			/* watching is optional */
@@ -467,7 +310,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 			version = (JSON.parse(await readFile(`${root}/package.json`, "utf8")) as { version?: string }).version;
 		} catch {
-			/* unreadable install */
+			return undefined; // transient read failure: do not cache the miss
 		}
 		versionCache.set(root, version);
 		return version;
@@ -532,26 +375,37 @@ export default function (pi: ExtensionAPI) {
 	const listProcesses = async (): Promise<ProcessItem[]> => {
 		let output: string;
 		try {
-			output = (await pi.exec("ps", ["-eo", "pid=,ppid=,comm=,etime="])).stdout;
+			// `args` is last and may contain spaces, so parse the four fixed columns
+			// with a regex instead of splitting on whitespace.
+			output = (await pi.exec("ps", ["-eo", "pid=,ppid=,comm=,etime=,args="])).stdout;
 		} catch {
 			return [];
 		}
-		const all = output
+		const parsed = output
 			.split("\n")
-			.map((line) => line.trim())
-			.filter(Boolean)
-			.map((line) => line.split(/\s+/));
+			.map((line) => /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$/.exec(line))
+			.filter((match): match is RegExpExecArray => match !== null)
+			.map((match) => ({
+				pid: Number(match[1] ?? NaN),
+				ppid: Number(match[2] ?? NaN),
+				comm: match[3] ?? "",
+				etime: match[4] ?? "",
+				args: match[5] ?? "",
+			}));
 		const parents = new Map<number, number>();
-		for (const parts of all) {
-			const pid = Number(parts[0]);
-			const ppid = Number(parts[1]);
-			if (Number.isFinite(pid) && Number.isFinite(ppid)) parents.set(pid, ppid);
-		}
-		const rows = all.filter((parts) => parts[2] === "pi");
+		for (const row of parsed) if (Number.isFinite(row.pid) && Number.isFinite(row.ppid)) parents.set(row.pid, row.ppid);
+
+		// `comm` is the basename on Linux but a (truncated) path on macOS, and a
+		// node/bun install reports `node`/`bun`; accept both shapes.
+		const rows = parsed.filter((row) => {
+			const comm = basename(row.comm).replace(/\.exe$/, "");
+			if (comm === "pi" || comm === "pi-coding-agent") return true;
+			return /^(node|bun)$/.test(comm) && /(^|[\s/])pi(-coding-agent)?([\s/]|$)/.test(row.args);
+		});
 
 		// One lsof call for all found pids gives each process's cwd and any open
 		// file under its pi install, from which we read the running version.
-		const pids = rows.map((parts) => Number(parts[0])).filter(Number.isFinite);
+		const pids = rows.map((row) => row.pid).filter(Number.isFinite);
 		const cwds = new Map<number, string>();
 		const roots = new Map<number, string>();
 		if (pids.length > 0) {
@@ -580,46 +434,70 @@ export default function (pi: ExtensionAPI) {
 		const shared = await readShared();
 
 		const items: ProcessItem[] = [];
-		for (const parts of rows) {
-			const pid = Number(parts[0]);
+		for (const row of rows) {
+			const { pid, etime } = row;
 			if (!Number.isFinite(pid)) continue;
 			const info = shared.get(pid);
 			const cwd = cwds.get(pid) ?? info?.cwd ?? (await readlink(`/proc/${pid}/cwd`).catch(() => undefined));
 			const root = roots.get(pid);
 			const tmux = (info?.pane ? byPane.get(info.pane) : undefined) ?? panes.get(pid);
-			const startMs = Date.now() - elapsedMs(parts[3] ?? "");
-			const session = cwd ? pickSessionInfo(await sessionsFor(cwd), startMs, tmux?.name) : undefined;
+			const elapsed = elapsedMs(etime);
+			// Without a parseable start time the session heuristic would guess wrong.
+			const session = cwd && elapsed !== undefined ? pickSessionInfo(await sessionsFor(cwd), Date.now() - elapsed, tmux?.name) : undefined;
 			// A publishing process is authoritative: no name means a brand-new
 			// session, so don't inherit the heuristic's older session title.
-			const label = info
-				? info.label?.trim() || "(new session)"
-				: session?.name?.trim() || session?.firstMessage?.trim().replace(/\s+/g, " ") || (cwd ? basename(cwd) : "pi");
+			const label = info ? sanitize(info.label?.trim() || "(new session)") : processLabelFallback(cwd, session);
 			items.push({
 				pid,
 				label,
 				version: root ? await readVersion(root) : undefined,
-				elapsed: shortElapsed(parts[3] ?? ""),
+				elapsed: shortElapsed(etime),
 				current: pid === process.pid,
 				cwd,
 				tmux,
 			});
 		}
 		// Stable, machine-wide order (ascending pid) so every window lists rows
-		// identically and a click never lands on a shifted row.
+		// identically and a click never hits a shifted row.
 		items.sort((a, b) => a.pid - b.pid);
-		return items.slice(0, MAX_PROCESSES);
+		const visible = items.slice(0, MAX_PROCESSES);
+		// Never hide this process's own row behind a busier machine's others.
+		if (!visible.some((item) => item.current)) {
+			const self = items.find((item) => item.current);
+			if (self) visible[visible.length - 1] = self;
+		}
+
+		// Drop status files for processes that are gone (and stale for a day), so
+		// pid reuse cannot attach a dead session's identity to a new process.
+		const livePids = new Set(items.map((item) => item.pid));
+		const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+		for (const [pid, status] of shared) {
+			if (livePids.has(pid) || status.updatedAt > cutoff) continue;
+			void unlink(join(SHARED_DIR, `${pid}.json`)).catch(() => undefined);
+		}
+		return visible;
 	};
 
 	let loading = false;
+	let reloadPending = false;
 
 	const loadProcesses = async () => {
-		if (loading) return;
+		if (loading) {
+			reloadPending = true;
+			return;
+		}
 		loading = true;
 		try {
 			state.processes = await listProcesses();
 			refresh();
+		} catch {
+			/* a failed poll must not break the panel or the process */
 		} finally {
 			loading = false;
+			if (reloadPending && !shuttingDown) {
+				reloadPending = false;
+				void loadProcesses();
+			}
 		}
 	};
 
@@ -659,6 +537,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", async (_event, source) => {
+		shuttingDown = false;
 		ctx = source;
 		if (source.mode !== "tui") return;
 		syncData(source);
@@ -674,16 +553,22 @@ export default function (pi: ExtensionAPI) {
 		refresh();
 		void publishSelf();
 		void loadProcesses();
+		// Renderer restarts can re-emit session_start; never leak an old interval.
+		if (timer) clearInterval(timer);
 		timer = setInterval(() => {
 			if (visible) void loadProcesses();
 		}, PROCESS_REFRESH_MS);
 	});
 
 	pi.on("session_shutdown", () => {
+		shuttingDown = true;
 		if (timer) {
 			clearInterval(timer);
 			timer = undefined;
 		}
+		reloadPending = false;
+		versionCache.clear();
+		sessionCache.clear();
 		watcher?.close();
 		watcher = undefined;
 		if (watchDebounce) {
@@ -756,9 +641,13 @@ export default function (pi: ExtensionAPI) {
 
 			const arg = args.trim().toLowerCase();
 			if (arg === "reload") {
-				const targets = state.processes.filter((item) => item.tmux && !item.current);
+				const targets = state.processes.filter((item): item is ProcessItem & { tmux: TmuxTarget } => Boolean(item.tmux) && !item.current);
 				await Promise.all(
-					targets.map((item) => pi.exec("tmux", ["send-keys", "-t", item.tmux!.pane, "/reload", "Enter"]).catch(() => undefined)),
+					targets.map((item) =>
+						pi.exec("tmux", ["send-keys", "-l", "-t", item.tmux.pane, "/reload"]).then(() =>
+							pi.exec("tmux", ["send-keys", "-t", item.tmux.pane, "Enter"]).catch(() => undefined),
+						).catch(() => undefined),
+					),
 				);
 				source.ui.notify(`Sent /reload to ${targets.length} pi pane${targets.length === 1 ? "" : "s"}`, "info");
 				return;

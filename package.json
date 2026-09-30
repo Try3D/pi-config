@@ -17,20 +17,23 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "lint": "eslint .",
+    "knip": "knip",
+    "audit:code": "npm run check && npm run lint && npm run knip"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "*",
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
-    "@types/node": "latest",
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22",
+    "eslint": "^10.11.0",
+    "knip": "^6.39.0",
     "typebox": "*",
-    "typescript": "latest"
+    "typescript": "^5.9",
+    "typescript-eslint": "^8.71.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-agent-core": "*",
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"

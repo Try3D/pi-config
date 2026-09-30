@@ -1,37 +1,37 @@
-# pi-agents — tmux-native subagents for pi
+# pi-agents: tmux-native subagents for pi
 
 ## Purpose
 
 A subagent yields exactly two things:
 
-1. **Mutations** — file changes on disk.
-2. **The text** — its final response.
+1. **Mutations**: file changes on disk.
+2. **The text**: its final response.
 
 Everything else (usage, session management) is secondary.
 
 ## tmux model
 
-- Run **only in the current tmux session** (here: `pi-agents`). Never create or
+- Run only in the current tmux session (here: `pi-agents`). Never create or
   attach to other sessions.
 - Session name/pane target comes from `$TMUX` +
   `tmux display-message -p '#{session_name}'`.
-- A **new window (tab) per batch of 4 subagents**.
-- Up to **4 tiled panes per tab** (2x2 via `select-layout tiled`).
+- A new window (tab) per batch of 4 subagents.
+- Up to 4 tiled panes per tab (2x2 via `select-layout tiled`).
 - 5th subagent opens the next tab.
 - Panes show the subagent's output live.
 
 ## Execution mode (forced by constraints)
 
-- Interactive TUI -> has an input box. **Rejected.**
-- `-p` text mode -> prints only the final text, nothing while running.
-  **Useless for observability** (verified in a real TTY).
-- Therefore: **`pi --mode json -p`** in each pane. Streams events live, exits
+- Interactive TUI has an input box. Rejected.
+- `-p` text mode prints only the final text, nothing while running.
+  Useless for observability (verified in a real TTY).
+- Therefore `pi --mode json -p` runs in each pane. Streams events live, exits
   when done, no input box.
 
 Pane rendering:
 
-- Default: raw JSON event stream (simple, truthful).
-- Optional: a `jq` one-liner to humanize text deltas + tool calls, e.g.
+- Default: the raw JSON event stream as pi emits it.
+- Optional: a `jq` one-liner to humanize text deltas and tool calls, for example
   ```
   pi --mode json -p ... | tee "$RUN/raw.jsonl" \
     | jq -r --unbuffered '
@@ -54,7 +54,7 @@ Pane rendering:
 
 ## Lifecycle
 
-- After the child exits, the pane **persists for 10 minutes**, then self-kills:
+- After the child exits, the pane persists for 10 minutes, then self-kills:
   `tmux set-window-option remain-on-exit on` (or run a shell that sleeps) plus a
   detached `sleep 600 && tmux kill-pane -t <pane>`.
 - Parent abort (Ctrl+C) kills the child panes.
@@ -88,7 +88,7 @@ tools: read, grep, find, ls, bash, edit, write
 System prompt: what this agent is for and the shape of its final answer.
 ```
 
-No `model` => inherit the dispatching session's model/thinking level.
+No `model` means inherit the dispatching session's model/thinking level.
 
 ## Modes
 
@@ -102,15 +102,15 @@ No `model` => inherit the dispatching session's model/thinking level.
 
 ## Human controls
 
-- `/agent:<name> <task>` — run a named agent directly (e.g. `/agent:scout find auth code`).
+- `/agent:<name> <task>`: run a named agent directly, for example `/agent:scout find auth code`.
   With no task, prompts for one via the input dialog.
-- `/agents` — list available agents and their commands.
+- `/agents`: list available agents and their commands.
 - Panes/windows: tab named `agents-N`; pane titles `pi:<agent>:<shortid>`.
 - TODO: `/agents jump <id>` and `/agents kill <id>`.
 
 ## Safety & edge cases
 
-- If `$TMUX` unset: error clearly (this extension is tmux-only by design).
+- If `$TMUX` is unset, fail with a clear message (this extension is tmux-only by design).
 - Project-local agents gated behind project trust.
 - Never touch panes/windows that are not ours (identify by window name prefix).
 - Preserve the user's existing pane layout; only mutate our own tabs.
@@ -123,8 +123,8 @@ No `model` => inherit the dispatching session's model/thinking level.
    inspectable later)?
 3. **Agents dir**: reuse `~/.pi/agent/agents/` (recommended) vs
    `~/.pi/agent/pi-agents/agents/`.
-4. **Persistence timer**: default 10 minutes — configurable per agent?
-5. **Overflow**: >4 tasks -> new tab per 4 (recommended) vs cap at 4.
+4. **Persistence timer**: default 10 minutes. Configurable per agent?
+5. **Overflow**: open a new tab per 4 tasks (recommended) vs cap at 4.
 
 ## Phases
 

@@ -4,26 +4,25 @@
  *
  * The pane shows a human-readable stream (via jq); raw.jsonl keeps the
  * structured event stream for the parent.
+ *
+ * Module split: script.ts (run.sh generation), jsonl.ts (raw.jsonl parsing),
+ * tmux.ts (pane allocation), changes.ts (git summary), index.ts (tool + commands).
  */
 
-import { execFile, spawn } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "./agents.ts";
 import { gitSummary } from "./changes.ts";
-import { acquirePane, currentSession, killPane } from "./tmux.ts";
+import { readFinalText, readRange, type RawEvent } from "./jsonl.ts";
+import { buildRunScript, piInvocation, safeRunName } from "./script.ts";
+import { acquirePane, currentSession, killPane, paneExists } from "./tmux.ts";
 
-const PANE_TTL_MS = 10 * 60 * 1000;
 const WAIT_TIMEOUT_MS = 10 * 60 * 1000;
 const POLL_MS = 400;
-
-const JQ_FILTER = `
-if .type == "message_update" and .assistantMessageEvent.type == "text_delta" then .assistantMessageEvent.delta
-elif .type == "message_end" and .message.role == "assistant" then
-  "\\n" + ([.message.content[]? | select(.type=="toolCall") | "\\u2192 \\(.name) \\(.arguments|tostring)"] | join("\\n")) + "\\n"
-else empty end`.trim();
+/** How often to check the pane still exists (every N polls). */
+const PANE_CHECK_EVERY = 12;
+const MAX_RUN_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface RunResult {
 	text: string;
@@ -34,82 +33,28 @@ export interface RunResult {
 	timedOut: boolean;
 }
 
-function shellQuote(value: string): string {
-	return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-/** Resolve how to invoke pi from inside the child shell. */
-function piInvocation(): { command: string; prefixArgs: string[] } {
-	const currentScript = process.argv[1];
-	const isBunVirtual = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtual && fs.existsSync(currentScript)) {
-		return { command: process.execPath, prefixArgs: [currentScript] };
-	}
-	const execName = path.basename(process.execPath).toLowerCase();
-	if (/^(node|bun)(\.exe)?$/.test(execName)) return { command: "pi", prefixArgs: [] };
-	return { command: process.execPath, prefixArgs: [] };
-}
-
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function readFinalText(rawPath: string): string {
-	let text = "";
-	let content: string;
+/** Delete stale run directories so runs/ does not grow forever. */
+function pruneRuns(runsDir: string): void {
+	let entries: fs.Dirent[];
 	try {
-		content = fs.readFileSync(rawPath, "utf-8");
+		entries = fs.readdirSync(runsDir, { withFileTypes: true });
 	} catch {
-		return "";
+		return;
 	}
-	for (const line of content.split("\n")) {
-		if (!line.trim()) continue;
-		let event: any;
+	const now = Date.now();
+	for (const entry of entries) {
+		if (!entry.isDirectory()) continue;
+		const dir = path.join(runsDir, entry.name);
 		try {
-			event = JSON.parse(line);
+			if (now - fs.statSync(dir).mtimeMs > MAX_RUN_AGE_MS) fs.rmSync(dir, { recursive: true, force: true });
 		} catch {
-			continue;
-		}
-		if (event.type === "message_end" && event.message?.role === "assistant") {
-			const parts = (event.message.content ?? [])
-				.filter((p: any) => p.type === "text")
-				.map((p: any) => p.text)
-				.join("");
-			if (parts) text = parts;
+			/* in use or gone */
 		}
 	}
-	return text;
-}
-
-async function buildRunScript(
-	runDir: string,
-	cwd: string,
-	command: string,
-	args: string[],
-): Promise<string> {
-	const cmdLine = [command, ...args].map(shellQuote).join(" ");
-	const script = [
-		"#!/usr/bin/env bash",
-		"set -o pipefail",
-		`cd ${shellQuote(cwd)} || exit 1`,
-		"if command -v jq >/dev/null 2>&1; then",
-		`  ${cmdLine} 2>${shellQuote(path.join(runDir, "stderr.log"))} | tee ${shellQuote(
-			path.join(runDir, "raw.jsonl"),
-		)} | jq -j --unbuffered ${shellQuote(JQ_FILTER)}`,
-		"else",
-		`  ${cmdLine} 2>${shellQuote(path.join(runDir, "stderr.log"))} | tee ${shellQuote(
-			path.join(runDir, "raw.jsonl"),
-		)}`,
-		"fi",
-		`echo "\${PIPESTATUS[0]}" > ${shellQuote(path.join(runDir, "exit"))}`,
-		`sleep ${Math.floor(PANE_TTL_MS / 1000)}`,
-		`tmux kill-pane -t "\${TMUX_PANE}" 2>/dev/null || true`,
-		"",
-	].join("\n");
-
-	const scriptPath = path.join(runDir, "run.sh");
-	fs.writeFileSync(scriptPath, script, { mode: 0o755 });
-	return scriptPath;
 }
 
 export async function runSubagent(options: {
@@ -123,9 +68,17 @@ export async function runSubagent(options: {
 	const { ctx, agent, task, signal, onUpdate } = options;
 	const cwd = options.cwd ?? ctx.cwd;
 
-	const runId = `${agent.name}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+	if (!process.env.TMUX) {
+		throw new Error("pi-agents requires tmux ($TMUX is not set). Run pi inside a tmux session.");
+	}
+	if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) {
+		throw new Error(`Subagent cwd does not exist or is not a directory: ${cwd}`);
+	}
+
+	const runId = `${safeRunName(agent.name)}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 	const runDir = path.join(getAgentDir(), "pi-agents", "runs", runId);
 	fs.mkdirSync(runDir, { recursive: true });
+	pruneRuns(path.dirname(runDir));
 
 	// System prompt
 	const promptPath = path.join(runDir, "prompt.md");
@@ -145,11 +98,8 @@ export async function runSubagent(options: {
 	if (prompt) args.push("--append-system-prompt", promptPath);
 	args.push(`Task: ${task}`);
 
-	const scriptPath = await buildRunScript(runDir, cwd, command, args);
+	const scriptPath = buildRunScript(runDir, cwd, command, args);
 
-	if (!process.env.TMUX) {
-		throw new Error("pi-agents requires tmux ($TMUX is not set). Run pi inside a tmux session.");
-	}
 	const session = await currentSession();
 	const paneId = await acquirePane({ session, cwd, scriptPath, title: `pi:${agent.name}` });
 
@@ -157,9 +107,47 @@ export async function runSubagent(options: {
 	const rawFile = path.join(runDir, "raw.jsonl");
 	const startedAt = Date.now();
 
+	// Incremental tail: parse only bytes appended since the previous poll,
+	// splitting on complete lines so a truncated (possibly mid-codepoint) read
+	// never corrupts the byte offset.
+	let scanOffset = 0;
+	let carry = Buffer.alloc(0);
+	let streamedText = "";
+	const pollStream = (): void => {
+		const chunk = readRange(rawFile, scanOffset);
+		if (!chunk) return;
+		scanOffset += chunk.length;
+		const buffer = Buffer.concat([carry, chunk]);
+		const lastNewline = buffer.lastIndexOf("\n");
+		if (lastNewline === -1) {
+			carry = buffer;
+			return;
+		}
+		carry = buffer.subarray(lastNewline + 1);
+		for (const line of buffer.subarray(0, lastNewline + 1).toString("utf-8").split("\n")) {
+			if (!line.trim()) continue;
+			let event: RawEvent;
+			try {
+				event = JSON.parse(line) as RawEvent;
+			} catch {
+				continue;
+			}
+			// A tool-only turn produces no assistant text; clear so the progress
+			// line does not keep showing a previous turn's output.
+			if (event.type === "message_start" && event.message?.role === "assistant") streamedText = "";
+			if (event.type === "message_end" && event.message?.role === "assistant") {
+				const parts = (event.message.content ?? [])
+					.filter((p) => p.type === "text")
+					.map((p) => p.text ?? "")
+					.join("");
+				if (parts) streamedText = parts;
+			}
+		}
+	};
+
 	try {
 		// Wait for the exit sentinel, streaming a tail to the parent UI.
-		while (true) {
+		for (let poll = 0; ; poll++) {
 			if (signal?.aborted) throw new Error("Subagent aborted");
 			if (fs.existsSync(exitFile)) break;
 			if (Date.now() - startedAt > WAIT_TIMEOUT_MS) {
@@ -173,8 +161,20 @@ export async function runSubagent(options: {
 					timedOut: true,
 				};
 			}
-			if (onUpdate && fs.existsSync(rawFile)) {
-				onUpdate(readFinalText(rawFile));
+			// A closed pane never writes the sentinel; fail in seconds, not minutes.
+			if (poll > 0 && poll % PANE_CHECK_EVERY === 0 && !(await paneExists(paneId))) {
+				return {
+					text: readFinalText(rawFile),
+					changes: await gitSummary(cwd),
+					exitCode: 1,
+					paneId,
+					runDir,
+					timedOut: false,
+				};
+			}
+			if (onUpdate) {
+				pollStream();
+				onUpdate(streamedText || "(running...)");
 			}
 			await sleep(POLL_MS);
 		}

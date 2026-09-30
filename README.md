@@ -1,4 +1,4 @@
-# Pi Extensions
+# Pi extensions
 
 Extensions for the [Pi coding agent](https://pi.dev).
 
@@ -24,6 +24,11 @@ pi -e ./extensions/pi-agents/index.ts
 ```
 
 ## Development
+
+The root `package.json` uses `"*"` for pi core `devDependencies`, which only
+resolve when pi itself is present, for example when you install this repo inside
+a pi installation. On a fresh machine, `npm install` will not resolve them from
+the registry.
 
 ```sh
 npm install

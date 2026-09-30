@@ -22,6 +22,9 @@ import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/
 
 export type AgentScope = "user" | "project" | "both";
 
+/** Only alphanumeric/dot/dash/underscore names are loadable (safe for paths, ids, commands). */
+const AGENT_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
 export interface AgentConfig {
 	name: string;
 	description: string;
@@ -37,6 +40,7 @@ interface AgentFrontmatter {
 	description?: unknown;
 	tools?: unknown;
 	model?: unknown;
+	[key: string]: unknown;
 }
 
 function parseToolList(value: unknown): string[] | undefined {
@@ -60,7 +64,11 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 	const agents: AgentConfig[] = [];
 	for (const entry of entries) {
 		if (!entry.name.endsWith(".md")) continue;
-		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+		if (
+			!entry.isFile() &&
+			!entry.isSymbolicLink() // symlink targets are accepted; unreadable ones are skipped below
+		)
+			continue;
 
 		const filePath = path.join(dir, entry.name);
 		let content: string;
@@ -72,6 +80,8 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 
 		const { frontmatter, body } = parseFrontmatter<AgentFrontmatter>(content);
 		if (typeof frontmatter.name !== "string" || typeof frontmatter.description !== "string") continue;
+		// Reject names that cannot round-trip through `/agent:<name>` or a session id.
+		if (!AGENT_NAME_RE.test(frontmatter.name)) continue;
 
 		agents.push({
 			name: frontmatter.name,
@@ -87,6 +97,7 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 }
 
 function findNearestProjectAgentsDir(cwd: string): string | null {
+	const home = process.env.HOME;
 	let dir = cwd;
 	while (true) {
 		const candidate = path.join(dir, CONFIG_DIR_NAME, "agents");
@@ -95,6 +106,9 @@ function findNearestProjectAgentsDir(cwd: string): string | null {
 		} catch {
 			/* keep walking */
 		}
+		// Stop at the repository root (or home/root) so an unrelated ancestor's
+		// .pi/agents cannot inject agent definitions.
+		if (fs.existsSync(path.join(dir, ".git")) || dir === home) return null;
 		const parent = path.dirname(dir);
 		if (parent === dir) return null;
 		dir = parent;
@@ -108,7 +122,21 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentConfig[] {
 		scope === "user" || !projectDir ? [] : loadAgentsFromDir(projectDir, "project");
 
 	const map = new Map<string, AgentConfig>();
-	for (const a of userAgents) map.set(a.name, a);
-	for (const a of projectAgents) map.set(a.name, a); // project overrides on "both"
+	const overridden: string[] = [];
+	for (const a of userAgents) {
+		if (map.has(a.name)) overridden.push(a.name);
+		map.set(a.name, a);
+	}
+	for (const a of projectAgents) {
+		if (map.has(a.name)) overridden.push(a.name);
+		map.set(a.name, a); // project overrides on "both"
+	}
+	if (overridden.length > 0) {
+		// Warn about overrides: the winning definition is usually intentional, but
+		// two agents sharing a name and behaving differently is confusing.
+		console.warn(
+			`[pi-agents] duplicate agent names ignored (later definition wins): ${overridden.join(", ")}`,
+		);
+	}
 	return Array.from(map.values());
 }

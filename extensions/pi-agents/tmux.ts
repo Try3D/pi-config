@@ -2,25 +2,25 @@
  * tmux primitives for pi-agents.
  *
  * Strictly uses the CURRENT tmux session. Subagents share tabs of up to
- * MAX_PANES_PER_WINDOW tiled panes each; overflow opens the next tab.
+ * MAX_PANES_PER_WINDOW tiled panes each; overflow opens the next tab. Owned
+ * windows carry the `@pi-agents` user option, so the extension never takes over
+ * a user window named `agents`.
  */
 
 import { execFile } from "node:child_process";
+import { shellQuote } from "./script.ts";
 
 const MAX_PANES_PER_WINDOW = 4;
 const WINDOW_RE = /^agents(-\d+)?$/;
+const TMUX_TIMEOUT_MS = 10_000;
 
 function tmux(args: string[]): Promise<string> {
 	return new Promise((resolve, reject) => {
-		execFile("tmux", args, { encoding: "utf-8" }, (error, stdout, stderr) => {
+		execFile("tmux", args, { encoding: "utf-8", timeout: TMUX_TIMEOUT_MS }, (error, stdout, stderr) => {
 			if (error) reject(new Error(`tmux ${args.join(" ")}: ${stderr || error.message}`));
 			else resolve(stdout);
 		});
 	});
-}
-
-export function isInsideTmux(): boolean {
-	return Boolean(process.env.TMUX);
 }
 
 export async function currentSession(): Promise<string> {
@@ -34,15 +34,23 @@ interface WindowInfo {
 }
 
 async function listAgentWindows(session: string): Promise<WindowInfo[]> {
-	const out = await tmux(["list-windows", "-t", session, "-F", "#{window_id}\t#{window_name}\t#{window_panes}"]);
+	const out = await tmux([
+		"list-windows",
+		"-t",
+		session,
+		"-F",
+		"#{window_id}\t#{window_name}\t#{window_panes}\t#{@pi-agents}",
+	]);
 	return out
 		.split("\n")
 		.filter(Boolean)
 		.map((line) => {
-			const [id, name, panes] = line.split("\t");
-			return { id, name, panes: Number(panes) };
+			const [id = "", name = "", panes = "", tag = ""] = line.split("\t");
+			return { id, name, panes: Number(panes), owned: tag === "1" };
 		})
-		.filter((w) => WINDOW_RE.test(w.name));
+		.filter((w) => w.owned || WINDOW_RE.test(w.name))
+		.filter((w) => Number.isFinite(w.panes))
+		.map(({ id, name, panes }) => ({ id, name, panes }));
 }
 
 async function nextWindowName(session: string): Promise<string> {
@@ -52,6 +60,9 @@ async function nextWindowName(session: string): Promise<string> {
 }
 
 // Serialize allocation so concurrent subagent calls can't race past the cap.
+// Per-process only: concurrent pi processes each have their own lock and can
+// still collectively exceed MAX_PANES_PER_WINDOW (best-effort, fine for the
+// 4-per-tab tiling which just re-wraps to the next window).
 let allocation: Promise<unknown> = Promise.resolve();
 function withLock<T>(fn: () => Promise<T>): Promise<T> {
 	const run = allocation.then(fn, fn);
@@ -85,13 +96,13 @@ export async function acquirePane(options: {
 			await tmux(["select-layout", "-t", window.id, "tiled"]);
 		} else {
 			const name = await nextWindowName(session);
-			paneId = (
+			const [newPane = "", windowId = ""] = (
 				await tmux([
 					"new-window",
 					"-d",
 					"-P",
 					"-F",
-					"#{pane_id}",
+					"#{pane_id}\t#{window_id}",
 					"-t",
 					session,
 					"-n",
@@ -100,7 +111,11 @@ export async function acquirePane(options: {
 					cwd,
 					command,
 				])
-			).trim();
+			)
+				.trim()
+				.split("\t");
+			paneId = newPane;			// Tag ownership so the extension (and future runs) only reuse its own tabs.
+			await tmux(["set-window-option", "-t", windowId, "@pi-agents", "1"]).catch(() => {});
 		}
 		if (title) await tmux(["select-pane", "-t", paneId, "-T", title]).catch(() => {});
 		return paneId;
@@ -115,10 +130,12 @@ export async function killPane(paneId: string): Promise<void> {
 	}
 }
 
-export async function listPanes(): Promise<string> {
-	return tmux(["list-panes", "-a", "-F", "#{session_name}\t#{window_name}\t#{pane_id}\t#{pane_title}"]);
-}
-
-function shellQuote(value: string): string {
-	return `'${value.replace(/'/g, `'\\''`)}'`;
+/** Whether a pane still exists (used to fail fast when the user closes it). */
+export async function paneExists(paneId: string): Promise<boolean> {
+	try {
+		await tmux(["list-panes", "-t", paneId, "-F", "#{pane_id}"]);
+		return true;
+	} catch {
+		return false;
+	}
 }

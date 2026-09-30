@@ -1,4 +1,4 @@
-# Repository Guidelines
+# Repository guidelines
 
 This repository contains TypeScript extensions for the [Pi coding agent](https://pi.dev).
 
@@ -12,11 +12,11 @@ This repository contains TypeScript extensions for the [Pi coding agent](https:/
 ## Tools
 
 - Use `rg` and `fd` for repository navigation.
-- Run `npm run check` after changes.
+- Run `npm run audit:code` after changes (typecheck + eslint + knip).
 
 ## Preferences
 
-- Keep changes simple, focused, and consistent with existing extension patterns.
+- Keep changes small and consistent with existing extension patterns.
 - Reuse existing helpers before introducing new abstractions.
 - Add argument completions to extension commands where useful.
 - Never add an AI co-author to commits.
