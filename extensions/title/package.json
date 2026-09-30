@@ -1,0 +1,24 @@
+{
+  "name": "@rsaran/pi-title",
+  "version": "0.1.0",
+  "description": "Generate session titles from the first exchange in Pi",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rsaran/pi-extensions.git",
+    "directory": "extensions/title"
+  },
+  "homepage": "https://github.com/rsaran/pi-extensions#title",
+  "keywords": ["pi-package", "pi-extension", "title", "session"],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": ["*.ts", "README.md"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "@rsaran/pi-sidebar",
+  "version": "0.1.0",
+  "description": "Docked info panel for the Pi coding agent",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rsaran/pi-extensions.git",
+    "directory": "extensions/sidebar"
+  },
+  "homepage": "https://github.com/rsaran/pi-extensions#sidebar",
+  "keywords": ["pi-package", "pi-extension", "sidebar", "tui"],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": ["*.ts", "README.md"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}

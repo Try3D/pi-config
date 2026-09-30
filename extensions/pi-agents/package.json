@@ -1,0 +1,25 @@
+{
+  "name": "@rsaran/pi-agents",
+  "version": "0.1.0",
+  "description": "tmux-native subagents for the Pi coding agent",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rsaran/pi-extensions.git",
+    "directory": "extensions/pi-agents"
+  },
+  "homepage": "https://github.com/rsaran/pi-extensions#pi-agents",
+  "keywords": ["pi-package", "pi-extension", "subagent", "tmux"],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": ["*.ts", "README.md"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
