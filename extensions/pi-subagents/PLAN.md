@@ -4,135 +4,129 @@
 
 A subagent yields exactly two things:
 
-1. **Mutations**: file changes on disk.
-2. **The text**: its final response.
+1. Changes to files on disk.
+2. The final response.
 
 Everything else (usage, session management) is secondary.
 
 ## tmux model
 
-- Run only in the current tmux session (here: `pi-subagents`). Never create or
+- Run only in the current tmux session. Use `$TMUX` and
+  `tmux display-message -p '#{session_name}'` to get its name. Do not create or
   attach to other sessions.
-- Session name/pane target comes from `$TMUX` +
-  `tmux display-message -p '#{session_name}'`.
-- A new window (tab) per batch of 4 subagents.
-- Up to 4 tiled panes per tab (2x2 via `select-layout tiled`).
-- 5th subagent opens the next tab.
-- Panes show the subagent's output live.
+- Append each new window at the end and name it with the smallest unused `_N`.
+  Reuse a missing `_N` label, but do not insert a window at an earlier position.
+- The pane shows the interactive pi TUI, not a JSON stream.
 
-## Execution mode (forced by constraints)
+## Execution mode
 
-- Interactive TUI has an input box. Rejected.
-- `-p` text mode prints only the final text, nothing while running.
-  It is useless for observability (verified in a real TTY).
-- Therefore `pi --mode json -p` runs in each pane. It streams events live, exits
-  when done, and has no input box.
+- The child runs `pi "<task>"` (interactive TUI) in the pane, not
+  `pi --mode json -p`. The TUI renders itself. It does not need a `jq` pipeline
+  or `raw.jsonl`.
+- The pane command does not use `run.sh`. TypeScript builds it and passes it to
+  tmux as one shell string:
+  - The env prefix includes `PI_SUBAGENT_RUN_DIR=<runDir>`,
+    `PI_SUBAGENT_DEPTH=<depth>`, `PI_SUBAGENT_PARENT_PID=<pid>`, and
+    `PI_SUBAGENT_KEEPALIVE_MS` when set.
+  - It includes the resolved pi invocation and its shell-quoted arguments.
+  - It redirects stderr to `stderr.log` with `2>stderr.log`.
+  - tmux `-c <cwd>` sets the working directory.
+  - tmux panes see the tmux server env, not the caller's. The command passes
+    every needed variable explicitly.
+- The `subagent` tool waits until the child reports completion. It does not need
+  to stream token deltas back to the parent.
 
-Pane rendering:
+## Completion contract
 
-- Default: the raw JSON event stream as pi emits it.
-- Optional: a `jq` one-liner to humanize text deltas and tool calls, for example
-  ```
-  pi --mode json -p ... | tee "$RUN/raw.jsonl" \
-    | jq -r --unbuffered '
-        if .type=="message_update" and .assistantMessageEvent.type=="text_delta"
-          then .assistantMessageEvent.delta
-        elif .type=="message_end" and .message.role=="assistant" then
-          (.message.content[]? | if .type=="toolCall"
-            then "→ \(.name) \(.arguments)" else empty end)
-        else empty end'
-  ```
-  Raw JSONL still goes to `raw.jsonl` for the parent.
+The extension installs the child hook (`child.ts`) only when
+`PI_SUBAGENT_RUN_DIR` is set:
 
-## Result assembly
+- `message_end` (assistant) tracks the latest text and `stopReason`.
+- `agent_settled` writes `result.json` and arms the idle timer.
+- `session_shutdown` writes a `failed` result if the run never settled.
 
-- **Text**: last assistant `message_end` in `raw.jsonl` (or the session file).
-- **Mutations**: `git -C <cwd> status --porcelain` + `git diff --stat`.
-- **Done**: the child process exits (non-interactive), so exit code is the
-  signal. `agent_settled` is available in the stream if needed.
-- **Failure**: non-zero exit, or `stopReason` of `error`/`aborted`.
+```
+<runDir>/
+  run.json      # static config: agent, depth, cwd, model, thinking, tools, promptPath, task, startedAt
+  prompt.md     # agent system prompt (passed via --append-system-prompt)
+  result.json   # child writes: { status, text, stopReason, sessionId, sessionFile, finishedAt }
+  stderr.log    # child stderr
+```
 
-## Lifecycle
+The parent polls `result.json`. If the pane disappears first, the parent treats
+the run as a crash and returns the tail of `stderr.log`. The parent does not
+need an exit sentinel.
 
-- After the child exits, the pane persists for 10 minutes, then self-kills:
-  `tmux set-window-option remain-on-exit on` (or run a shell that sleeps) plus a
-  detached `sleep 600 && tmux kill-pane -t <pane>`.
-- Parent abort (Ctrl+C) kills the child panes.
-- Reuse empty/killed panes for later subagents if convenient.
+## Keep-alive
+
+- The pane stays open for 10 minutes after each settle. A keystroke, submitted
+  prompt, new turn, or blocking dialog restarts the timer. When the timer
+  expires, pi exits and the pane closes. Set `PI_SUBAGENT_KEEPALIVE_MS` to
+  change the timeout.
+- The parent returns when the first `result.json` appears. The live pane remains
+  available for reading or follow-up turns.
+
+## Resume
+
+- `run.json` stores the data needed to relaunch the same session.
+- `subagent({ agent_id, task })` and `/agents resume <runId> <task>` continue
+  the run's existing session. The `agent_id` in each reply is the run id. The
+  agent can continue the conversation without handling tmux or pane names.
+- Resume sends the task to the run's live pane. If that pane is gone, it launches
+  a new pane with the same session ID. The open command focuses the live pane or
+  launches it if needed.
+- `/agents open <runId>` opens the existing session without a task.
+- `sessionId === runId`, so no extra lookup is needed.
+
+## Recursion
+
+- The root session has depth 0. The parent sets
+  `PI_SUBAGENT_DEPTH = depth + 1`.
+- At depth 4, `MAX_SUBAGENT_DEPTH = 4` prevents the extension from registering
+  the `subagent` tool. Human commands have no depth limit.
+- Nested subagents get their own windows. The sidebar displays them as a
+  navigable tree.
 
 ## Components
 
 ```
 pi-subagents/
-  index.ts      # extension entry: `subagent` tool + /agents commands
+  index.ts      # extension entry: child hook + `subagent` tool + command wiring
+  child.ts      # child-side settle hook, keep-alive, shutdown
+  run.ts        # run dir/run.json, launch command, wait, resume, list, open
+  shell.ts      # shell quoting + pi invocation resolution
+  tmux.ts       # current-session window/pane management (open, kill)
   agents.ts     # agent definition discovery + frontmatter
-  tmux.ts       # current-session pane/window management (split, tile, kill)
-  run.ts        # build child command, spawn in pane, tee raw.jsonl, collect
   changes.ts    # git status/diff summary for a cwd
-  agents/       # sample agent definitions (.md)
+  commands.ts   # /agents, /agents runs|open|resume, /agent:<name>
 ```
-
-## Agent definitions
-
-Markdown + YAML frontmatter from `~/.pi/agent/agents/` and (trust-gated)
-`.pi/agents/`:
-
-```markdown
----
-name: worker
-description: General-purpose subagent
-model: opencode-go/deepseek-v4.1-flash
-tools: read, grep, find, ls, bash, edit, write
----
-
-System prompt: what this agent is for and the shape of its final answer.
-```
-
-No `model` means inherit the dispatching session's model/thinking level.
-
-## Modes
-
-`subagent` tool:
-
-| Mode     | Params             | Behavior                                     |
-|----------|--------------------|----------------------------------------------|
-| single   | `{ agent, task }`  | 1 pane, wait for exit, return                |
-| parallel | `{ tasks: [...] }` | up to 4 panes/tab (next tab overflows), wait |
-| chain    | `{ chain: [...] }` | sequential panes, `{previous}` substitution  |
 
 ## Human controls
 
-- `/agent:<name> <task>`: run a named agent directly, for example `/agent:scout find auth code`.
-  With no task, prompts for one via the input dialog.
-- `/agents`: list available agents and their commands.
-- Panes/windows: tab named `agents-N`; pane titles `pi:<agent>:<shortid>`.
-- TODO: `/agents jump <id>` and `/agents kill <id>`.
+- `/agent:<name> <task>` runs a named agent. If you omit the task, the input
+  dialog asks for one.
+- `/agents` lists agents.
+- `/agents runs` lists recent runs.
+- `/agents open <runId>` and `/agents resume <runId> <task>` reopen or continue a
+  run.
+- Tabs use names `_1`, `_2`, `_3`, and so on. Pane titles use `_N pi:<agent>`.
 
-## Safety & edge cases
+## Safety and edge cases
 
-- If `$TMUX` is unset, fail with a clear message (this extension is tmux-only by design).
-- The extension loads project-local agents only for trusted projects.
-- Never touch panes/windows the extension does not own (identify by window name prefix).
-- Preserve the user's existing pane layout; only mutate its own tabs.
-
-## Open decisions
-
-1. **Pane rendering**: raw JSON (simplest) vs the `jq` humanizer (recommended for
-   2x2 panes where raw JSON is hard to read)?
-2. **Sessions**: `--no-session` (ephemeral) vs `--session-id <id>` (resumable /
-   inspectable later)?
-3. **Agents dir**: reuse `~/.pi/agent/agents/` (recommended) vs
-   `~/.pi/agent/pi-subagents/agents/`.
-4. **Persistence timer**: default 10 minutes. Configurable per agent?
-5. **Overflow**: open a new tab per 4 tasks (recommended) vs cap at 4.
+- If `$TMUX` is unset, the extension reports an error and explains that it only
+  runs inside tmux.
+- The extension rejects unknown `runId` values and invalid ids before it
+  accesses the filesystem.
+- Before a resume, the extension renames a stale `result.json` to
+  `result.<timestamp>.json` so the old result cannot satisfy the new wait.
+- The commands target only the pane recorded for each run.
 
 ## Phases
 
-- **Phase 0**: DONE. `agents.ts` + `tmux.ts` + `run.ts` + `changes.ts`, single-mode
-  `subagent` tool: spawns a new tab in the current session, waits for exit,
-  returns final text + git summary. Verified end-to-end.
-- **Phase 1**: DONE. Tiling to 4 panes/tab (`agents`, `agents-2`, ...), mutex-guarded
-  allocation, 10-min pane persistence, abort kills panes.
-- **Phase 2**: parallel + chain modes, tab overflow.
-- **Phase 3**: `/agents` list/jump/kill.
-- **Phase 4**: trust gating, sample agents, docs.
+- Phases 0 and 1 are done. They add single-window execution and a cross-process
+  allocation lock with `tmux wait-for`. They also handle aborts.
+- Phase 2 (v2) is done. It adds full-TUI execution without `run.sh` or `jsonl`,
+  the settle hook, a 10-minute keep-alive, resume commands (`resume`, `open`,
+  `runs`), and depth-4 nesting.
+- Parallel and chain modes are still planned. Background and detached runs,
+  along with per-agent settings, are also planned.

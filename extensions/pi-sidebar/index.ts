@@ -22,17 +22,23 @@
  * `/sidebar reload`     send /reload to every pi pane in tmux
  * `ctrl+shift+s`        toggle visibility
  *
- * In fullscreen mode, clicking a process row switches tmux to that process's
- * pane (only when running inside tmux).
+ * The panel shows one machine-wide process tree in every pane: root sessions
+ * grouped by workspace, subagents nested under their spawner (rows prefixed with
+ * the `_N` tmux tab id), with the current node accented. Clicking a row switches
+ * tmux to that process's pane (only when running inside tmux); subagent panes
+ * also get a right-aligned `go up` button on their workspace heading that jumps
+ * to the parent.
  *
  * Session labels come from the session's name when set (see the separate
- * `title` extension, which names sessions with a small model) and fall back
- * to the session's first user message.
+ * `title` extension, which names sessions with a small model). A publishing
+ * process with no name shows `(new session)`; a process with no status file at
+ * all falls back to its first user message, then its cwd basename.
  *
  * Each process publishes its own status to `~/.pi/agent/sidebar/<pid>.json`
- * (label, cwd, tmux pane, streaming). Every sidebar watches that directory,
- * so a change anywhere (a title, a new pane) live-updates all running
- * sidebars; ps decides which pids exist.
+ * (label, cwd, tmux pane, streaming, parent pid). Every sidebar watches that
+ * directory, so a change anywhere (a title, a new pane) live-updates all running
+ * sidebars; ps decides which pids exist. The parent pid links subagents to the
+ * session that spawned them, which is how the sidebar builds its subagent tree.
  *
  * Module split: types.ts (constants + shared types), config.ts (width
  * persistence), format.ts (pure formatting/parsing), component.ts (the panel TUI
@@ -64,11 +70,11 @@ import { QuietFooter } from "./footer.ts";
 import { SidebarComponent } from "./component.ts";
 import { clampLabelWidth, clampWidth, readConfig, settingsPath, writeConfig } from "./config.ts";
 import {
-	MAX_PROCESSES,
 	MAX_WIDTH,
 	MAX_LABEL_WIDTH,
 	MIN_LABEL_WIDTH,
 	MIN_TERMINAL_WIDTH,
+	MIN_TRANSCRIPT_WIDTH,
 	MIN_WIDTH,
 	PROCESS_REFRESH_MS,
 	SHARED_DIR,
@@ -98,6 +104,7 @@ export default function (pi: ExtensionAPI) {
 	let wrapped: Component | undefined;
 	let wrappedSide: Side | undefined;
 	let wrappedWidth: number | undefined;
+	let wrappedEffective: number | undefined;
 	let lastTheme: Theme | undefined;
 	const config = readConfig();
 	let width = config.width;
@@ -120,13 +127,24 @@ export default function (pi: ExtensionAPI) {
 	const makeSidebar = () =>
 		new SidebarComponent(() => state, theme, height, () => side, () => labelWidth, (pid) => void focusProcess(pid));
 
+	/**
+	 * Panel width for the current terminal: the configured width when there is
+	 * room, shrinking down to MIN_WIDTH so the transcript keeps
+	 * MIN_TRANSCRIPT_WIDTH columns.
+	 */
+	const dockedWidth = () => {
+		const available = tui?.terminal.columns ?? 0;
+		return available > 0 ? Math.max(MIN_WIDTH, Math.min(width, available - MIN_TRANSCRIPT_WIDTH)) : width;
+	};
+
 	const buildWrapped = (root: Component): Component => {
 		const panel: StackEntry = {
 			component: makeSidebar(),
-			basis: width,
-			minSize: width,
+			basis: dockedWidth(),
+			minSize: MIN_WIDTH,
 			maxSize: width,
 			shrink: 0,
+			// Hide only when even the minimum panel and a usable transcript cannot fit.
 			visible: (viewport) => viewport.width >= MIN_TERMINAL_WIDTH,
 		};
 		const main: StackEntry = { component: root, basis: 0, grow: 1, shrink: 1, minSize: 1 };
@@ -175,10 +193,11 @@ export default function (pi: ExtensionAPI) {
 			if (!originalRoot && current) originalRoot = current;
 			if (current && current !== wrapped && current !== originalRoot) return;
 			if (!originalRoot) return;
-			if (!wrapped || wrappedSide !== side || wrappedWidth !== width) {
+			if (!wrapped || wrappedSide !== side || wrappedWidth !== width || wrappedEffective !== dockedWidth()) {
 				wrapped = buildWrapped(originalRoot);
 				wrappedSide = side;
 				wrappedWidth = width;
+				wrappedEffective = dockedWidth();
 			}
 			tui.setLayoutRoot(visible ? wrapped : originalRoot);
 			return;
@@ -189,6 +208,7 @@ export default function (pi: ExtensionAPI) {
 		originalRoot = undefined;
 		wrappedSide = undefined;
 		wrappedWidth = undefined;
+		wrappedEffective = undefined;
 		if (overlay && (overlaySide !== side || overlayWidth !== width)) {
 			overlay.hide();
 			overlay = undefined;
@@ -208,6 +228,7 @@ export default function (pi: ExtensionAPI) {
 			wrapped = undefined;
 			wrappedSide = undefined;
 			wrappedWidth = undefined;
+			wrappedEffective = undefined;
 		}
 		ensureAnimation();
 		void publishSelf();
@@ -237,6 +258,11 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	const ownFile = join(SHARED_DIR, `${process.pid}.json`);
+	/** This process's parent pi pid, set by pi-subagents when this session was spawned as a subagent. */
+	const parentPid = (() => {
+		const value = Number(process.env.PI_SUBAGENT_PARENT_PID);
+		return Number.isFinite(value) && value > 0 ? value : undefined;
+	})();
 	let publishedSignature: string | undefined;
 	let watcher: FSWatcher | undefined;
 	let watchDebounce: ReturnType<typeof setTimeout> | undefined;
@@ -259,6 +285,7 @@ export default function (pi: ExtensionAPI) {
 				cwd: state.cwd,
 				pane: process.env.TMUX_PANE,
 				streaming: state.streaming,
+				parentPid,
 				updatedAt: Date.now(),
 			};
 			await writeFile(ownFile, `${JSON.stringify(status)}\n`, { mode: 0o600 });
@@ -289,13 +316,19 @@ export default function (pi: ExtensionAPI) {
 			// Published by another process: validate instead of trusting the shape.
 			const status = raw as Partial<SharedStatus>;
 			if (typeof status?.pid !== "number" || !Number.isFinite(status.pid)) continue;
+			// Only accept a file named after the pid it claims, so a mis-named record
+			// cannot shadow another process or defeat the stale-file cleanup below.
+			if (entry.name !== `${status.pid}.json`) continue;
 			const str = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
+			const parentPid = status.parentPid;
+			const pane = str(status.pane);
 			statuses.set(status.pid, {
 				pid: status.pid,
 				label: str(status.label),
 				cwd: str(status.cwd),
-				pane: str(status.pane),
+				pane: pane && /^%\d+$/.test(pane) ? pane : undefined,
 				streaming: status.streaming === true,
+				parentPid: typeof parentPid === "number" && Number.isFinite(parentPid) && parentPid > 0 ? parentPid : undefined,
 				updatedAt: typeof status.updatedAt === "number" ? status.updatedAt : 0,
 			});
 		}
@@ -333,16 +366,16 @@ export default function (pi: ExtensionAPI) {
 		if (pids.length === 0 || !process.env.TMUX) return { byPid, byPane };
 		let output: string;
 		try {
-			output = (await pi.exec("tmux", ["list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}\t#{session_id}\t#{window_id}\t#{pane_title}"])).stdout;
+			output = (await pi.exec("tmux", ["list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}\t#{session_id}\t#{window_id}\t#{pane_title}\t#{window_name}"])).stdout;
 		} catch {
 			return { byPid, byPane };
 		}
 		const paneByPid = new Map<number, TmuxTarget>();
 		for (const line of output.split("\n")) {
-			const [pane, pidText, session, window, title] = line.split("\t");
+			const [pane, pidText, session, window, title, windowName] = line.split("\t");
 			const panePid = Number(pidText);
 			if (pane && session && window && Number.isFinite(panePid)) {
-				const target = { session, window, pane, name: title ? titleSessionName(title) : undefined };
+				const target = { session, window, pane, name: title ? titleSessionName(title) : undefined, windowName: windowName || undefined };
 				paneByPid.set(panePid, target);
 				byPane.set(pane, target);
 			}
@@ -456,17 +489,12 @@ export default function (pi: ExtensionAPI) {
 				tmux,
 				// Own liveness is local state; others come from their published status.
 				streaming: pid === process.pid ? state.streaming : info?.streaming === true,
+				parentPid: info?.parentPid,
 			});
 		}
 		// Stable, machine-wide order (ascending pid) so every window lists rows
 		// identically and a click never hits a shifted row.
 		items.sort((a, b) => a.pid - b.pid);
-		const visible = items.slice(0, MAX_PROCESSES);
-		// Never hide this process's own row behind a busier machine's others.
-		if (!visible.some((item) => item.current)) {
-			const self = items.find((item) => item.current);
-			if (self) visible[visible.length - 1] = self;
-		}
 
 		// Drop status files for processes that are gone (and stale for a day), so
 		// pid reuse cannot attach a dead session's identity to a new process.
@@ -476,7 +504,7 @@ export default function (pi: ExtensionAPI) {
 			if (livePids.has(pid) || status.updatedAt > cutoff) continue;
 			void unlink(join(SHARED_DIR, `${pid}.json`)).catch(() => undefined);
 		}
-		return visible;
+		return items;
 	};
 
 	let loading = false;
@@ -511,6 +539,22 @@ export default function (pi: ExtensionAPI) {
 			done(undefined);
 			return { render: () => [], invalidate: () => {} };
 		});
+	};
+
+	/**
+	 * Rebuild the docked layout when the terminal resizes. The HStack entry sets
+	 * the panel width, so a change requires wrapping the layout root again.
+	 */
+	let onResize: (() => void) | undefined;
+	const ensureResizeListener = () => {
+		if (onResize) return;
+		onResize = () => refresh();
+		process.stdout.on("resize", onResize);
+	};
+	const removeResizeListener = () => {
+		if (!onResize) return;
+		process.stdout.off("resize", onResize);
+		onResize = undefined;
 	};
 
 	/** Replace the built-in footer with one that omits the session name. */
@@ -550,6 +594,7 @@ export default function (pi: ExtensionAPI) {
 		syncData(source);
 
 		await ensureTui(source);
+		ensureResizeListener();
 		installFooter(source);
 		await startWatching();
 		refresh();
@@ -564,6 +609,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", () => {
 		shuttingDown = true;
+		removeResizeListener();
 		if (timer) {
 			clearInterval(timer);
 			timer = undefined;
@@ -601,6 +647,7 @@ export default function (pi: ExtensionAPI) {
 		wrapped = undefined;
 		wrappedSide = undefined;
 		wrappedWidth = undefined;
+		wrappedEffective = undefined;
 		tui = undefined;
 		ctx = undefined;
 	});

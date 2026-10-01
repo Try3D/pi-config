@@ -2,10 +2,13 @@
 
 tmux-native subagents for the [Pi coding agent](https://pi.dev).
 
-Each subagent is a separate `pi` session running in a tiled pane of the current
-tmux session (4 panes per tab, overflow to `agents-2`, `agents-3`, …). The pane
-streams the child's progress; the parent collects the final text and a git change
-summary.
+Each subagent runs an interactive `pi` session in its own tmux window (tab).
+The window is added at the end and named `_1`, `_2`, `_3`, and so on. The pane
+shows the full TUI. The parent waits for the child to finish, then returns its
+final text and a git change summary. The pane stays open for 10 minutes after
+each settle. A keystroke, submitted prompt, new turn, or blocking dialog
+restarts the timer. When the timer expires, pi exits and the pane closes. Set
+`PI_SUBAGENT_KEEPALIVE_MS` to change the timeout.
 
 ## Install
 
@@ -23,14 +26,18 @@ LLM-facing tool:
 
 ```text
 subagent({ agent: "scout", task: "find the auth flow" })
+// reply ends with an id, for example `agent id: scout-mu4x...`
+subagent({ agent_id: "scout-mu4x...", task: "now trace the token refresh path" })
 ```
 
 Human-facing commands:
 
 ```text
-/agent:scout find the auth flow
-/agent:worker refactor the parser
-/agents                  list available agents
+/agent:scout find the auth flow     run an agent directly
+/agents                             list available agents
+/agents runs                        list recent runs with their status
+/agents open <runId>                reopen a past run's session in a pane
+/agents resume <runId> <task>       continue a past run with a new task
 ```
 
 ## Agent definitions
@@ -56,18 +63,32 @@ System prompt for the agent.
 
 ## How it works
 
-- Spawns `pi --mode json -p --session-id <id> --name "[agent:<name>] <task>"` in a
-  tmux pane via a generated `run.sh`. Naming the child up front makes subagent
-  sessions identifiable in `/resume`, the tmux pane, and the sidebar; the child
-  also gets `PI_AGENTS_AGENT=<name>`, which the `title` extension uses to keep the
-  `[agent:<name>]` prefix if the title is regenerated.
-- Raw events stream to `raw.jsonl`; the pane shows a `jq`-formatted view when
-  `jq` is installed, and the raw JSON stream otherwise.
-- The parent waits on an `exit` sentinel, then reads the last assistant message
-  and `git status` / `git diff --stat` from the run cwd.
-- Panes persist for 10 minutes after exit, then self-clean. Aborting a tool run
-  kills the child pane; session shutdown aborts `/agent:<name>` command runs, and
-  the extension notices a closed pane within a few seconds.
+- The parent launches `pi --session-id <runId> --name "<task>" "<task>"` in a
+  tmux pane. The child is a full interactive pi session (not `--mode json`),
+  named with the task so it is identifiable in `/resume` and the sidebar; the
+  tmux pane title is `_N pi:<agent>`.
+- The child hook writes `result.json` (final text, status, session file) when
+  the agent settles; the parent returns as soon as it appears.
+- The pane stays open for 10 minutes after each settle. A keystroke, submitted
+  prompt, new turn, or blocking dialog restarts the timer. When the timer
+  expires, pi exits and the pane closes. Set `PI_SUBAGENT_KEEPALIVE_MS` to
+  change the timeout.
+- Every run writes `run.json` under `<agentDir>/pi-subagents/runs/<runId>/`
+  (default `~/.pi/agent/pi-subagents/runs/<runId>/`; respects
+  `PI_CODING_AGENT_DIR`). When it creates a run, the extension prunes run
+  directories older than seven days.
+- The `agent_id` from a reply continues the same session, reusing its live pane
+  when available.
+- Subagents can nest up to depth 4. At depth 4, the extension does not register
+  the `subagent` tool, so a child cannot spawn another subagent.
+
+## Lifecycle and failure
+
+- Aborting a tool run (Ctrl+C) kills the child pane.
+- Session shutdown aborts `/agent:<name>` and `/agents` command runs.
+- The parent detects a crash when the pane disappears. It returns the tail of
+  `stderr.log` as the failure reason.
+- The parent kills a run if it does not settle within 10 minutes.
 
 ## Security
 

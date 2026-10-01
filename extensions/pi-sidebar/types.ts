@@ -13,14 +13,20 @@ export const MAX_WIDTH = 80;
 export const DEFAULT_LABEL_WIDTH = 20;
 export const MIN_LABEL_WIDTH = 8;
 export const MAX_LABEL_WIDTH = 60;
-export const MIN_TERMINAL_WIDTH = 100;
-export const MAX_PROCESSES = 12;
+/** Columns always reserved for the transcript/editor when the docked panel shares the row. */
+export const MIN_TRANSCRIPT_WIDTH = 30;
+/** Below this terminal width the sidebar hides; at or above it the panel shrinks to fit. */
+export const MIN_TERMINAL_WIDTH = MIN_WIDTH + MIN_TRANSCRIPT_WIDTH;
 export const PROCESS_REFRESH_MS = 5000;
 
 /** Nerd Font progress-spinner frames (nf-extra-progress_spinner_1..6, U+EE06-U+EE0B). */
 export const SPINNER_FRAMES = ["\uee06", "\uee07", "\uee08", "\uee09", "\uee0a", "\uee0b"];
 /** Marker for process rows that are not currently loading (Nerd Font icon, U+F09DE). */
 export const INACTIVE_MARKER = "\u{f09de}";
+/** Marker for a subagent in the sidebar tree (Nerd Font icon, U+F167A). */
+export const SUBAGENT_MARKER = "\u{f167a}";
+/** Marker for the "go up" row that jumps to the parent session (Nerd Font, U+F148). */
+export const GO_UP_MARKER = "\u{f148}";
 /** Animation interval; ~8 fps is smooth without burning CPU. */
 export const SPINNER_MS = 120;
 
@@ -31,6 +37,7 @@ export interface TmuxTarget {
 	window: string;
 	pane: string;
 	name?: string;
+	windowName?: string;
 }
 
 export interface ProcessItem {
@@ -42,6 +49,8 @@ export interface ProcessItem {
 	tmux?: TmuxTarget;
 	/** Whether the process is currently generating (drives the spinner). */
 	streaming?: boolean;
+	/** Pid of the pi process that spawned this subagent, if any. */
+	parentPid?: number;
 }
 
 /** Per-process status published to disk so every sidebar sees every pi exactly as it sees itself. */
@@ -51,6 +60,7 @@ export interface SharedStatus {
 	cwd?: string;
 	pane?: string;
 	streaming?: boolean;
+	parentPid?: number;
 	updatedAt: number;
 }
 

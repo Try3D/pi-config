@@ -3,9 +3,13 @@
  * - agent_settled: "finished" when pi will not continue automatically
  * - ui_prompt_start: "needs attention" when a blocking prompt appears
  *
+ * Subagent panes (PI_SUBAGENT_RUN_DIR set) do not send the "finished"
+ * notification. Their parent reports each result, so a notification for every
+ * run would be redundant. Prompts still notify because they block.
+ *
  * Prompts that close within PROMPT_NOTIFY_DELAY_MS do not notify. Extensions
- * sometimes open a no-op custom overlay just to grab a TUI handle (the sidebar
- * does this on every session_start), which otherwise notifies on every startup,
+ * sometimes open a no-op custom overlay to get a TUI handle (the sidebar does
+ * this on every session_start), which otherwise notifies on every startup,
  * /reload, and /new.
  *
  * Title uses the project folder name so you know which window finished.
@@ -56,6 +60,8 @@ export default function (pi: ExtensionAPI) {
 		text ? (text.length > 140 ? `${text.slice(0, 139)}…` : text) : "Finished";
 
 	pi.on("agent_settled", (_event, ctx) => {
+		// Do not notify when a subagent pane finishes. Its parent reports the result.
+		if (process.env.PI_SUBAGENT_RUN_DIR) return;
 		if (!isInteractive(ctx) || stopReason === "aborted") return;
 		notify(`π ${basename(ctx.cwd)}`, preview(lastText));
 	});

@@ -1,22 +1,21 @@
 /**
  * tmux pane operations for pi-subagents.
  *
- * Strictly uses the CURRENT tmux session. Subagents share tabs of up to
- * MAX_PANES_PER_WINDOW tiled panes each; overflow opens the next tab. Owned
- * windows carry the `@pi-subagents` user option, so the extension never takes over
- * a user window named `agents`.
+ * Strictly uses the CURRENT tmux session. Each subagent gets its own window
+ * (tab) with a single pane: windows are appended at the end (rightmost) and
+ * named `_1`, `_2`, `_3`, …. The window is the subagent's pane and the unit of
+ * cleanup, so there is no tiling or window reuse.
  */
 
 import { execFile } from "node:child_process";
-import { shellQuote } from "./script.ts";
 
-const MAX_PANES_PER_WINDOW = 4;
-const WINDOW_RE = /^agents(-\d+)?$/;
 const TMUX_TIMEOUT_MS = 10_000;
+/** Short wait for the allocation lock so a stale lock cannot stall a launch for long. */
+const LOCK_TIMEOUT_MS = 3_000;
 
-function tmux(args: string[]): Promise<string> {
+function tmux(args: string[], timeout = TMUX_TIMEOUT_MS): Promise<string> {
 	return new Promise((resolve, reject) => {
-		execFile("tmux", args, { encoding: "utf-8", timeout: TMUX_TIMEOUT_MS }, (error, stdout, stderr) => {
+		execFile("tmux", args, { encoding: "utf-8", timeout }, (error, stdout, stderr) => {
 			if (error) reject(new Error(`tmux ${args.join(" ")}: ${stderr || error.message}`));
 			else resolve(stdout);
 		});
@@ -27,41 +26,15 @@ export async function currentSession(): Promise<string> {
 	return (await tmux(["display-message", "-p", "#{session_name}"])).trim();
 }
 
-interface WindowInfo {
-	id: string;
-	name: string;
-	panes: number;
-}
-
-async function listAgentWindows(session: string): Promise<WindowInfo[]> {
-	const out = await tmux([
-		"list-windows",
-		"-t",
-		session,
-		"-F",
-		"#{window_id}\t#{window_name}\t#{window_panes}\t#{@pi-subagents}",
-	]);
-	return out
-		.split("\n")
-		.filter(Boolean)
-		.map((line) => {
-			const [id = "", name = "", panes = "", tag = ""] = line.split("\t");
-			return { id, name, panes: Number(panes), owned: tag === "1" };
-		})
-		.filter((w) => w.owned || WINDOW_RE.test(w.name))
-		.filter((w) => Number.isFinite(w.panes))
-		.map(({ id, name, panes }) => ({ id, name, panes }));
-}
-
+/** Smallest `_N` not already used by any window in the session. */
 async function nextWindowName(session: string): Promise<string> {
-	const used = new Set((await listAgentWindows(session)).map((w) => w.name));
-	if (!used.has("agents")) return "agents";
-	for (let i = 2; ; i++) if (!used.has(`agents-${i}`)) return `agents-${i}`;
+	const used = new Set(
+		(await tmux(["list-windows", "-t", session, "-F", "#{window_name}"])).split("\n").filter(Boolean),
+	);
+	for (let i = 1; ; i++) if (!used.has(`_${i}`)) return `_${i}`;
 }
 
-// Serialize allocation so concurrent subagent calls can't race past the cap.
-// This lock lives in one process, so separate pi processes can still exceed
-// MAX_PANES_PER_WINDOW together. The extra panes wrap to the next window.
+// Serialize allocation so concurrent subagent calls can't race to the same name.
 let allocation: Promise<unknown> = Promise.resolve();
 function withLock<T>(fn: () => Promise<T>): Promise<T> {
 	const run = allocation.then(fn, fn);
@@ -73,51 +46,68 @@ function withLock<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Acquire a pane for a subagent: fill an existing `agents*` window with
- * capacity, else open a new tab. The pane runs `bash <scriptPath>`.
+ * Cross-process lock channel. Nested subagents run in separate pi processes that
+ * allocate at the same time; the in-process lock cannot stop them from picking
+ * the same `_N`. tmux's `wait-for -L/-U` is a server-wide mutex (held until `-U`,
+ * even after the locking client exits).
+ */
+const ALLOC_LOCK = "pi-subagents-alloc";
+
+/**
+ * Try to get the cross-process lock. A timeout may mean a live process holds it,
+ * so proceed unlocked rather than risk releasing another process's lock. A
+ * duplicate `_N` is cosmetic. Later launches should not stall indefinitely.
+ */
+async function lockAlloc(): Promise<boolean> {
+	try {
+		await tmux(["wait-for", "-L", ALLOC_LOCK], LOCK_TIMEOUT_MS);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Acquire a pane for a subagent: open a new tab at the end of the window list.
+ * `command` is a full shell command string, run by tmux in the new pane.
  */
 export async function acquirePane(options: {
 	session: string;
 	cwd: string;
-	scriptPath: string;
+	command: string;
 	title?: string;
 }): Promise<string> {
-	const { session, cwd, scriptPath, title } = options;
-	const command = `bash ${shellQuote(scriptPath)}`;
+	const { session, cwd, command, title } = options;
 
 	return withLock(async () => {
-		const window = (await listAgentWindows(session)).find((w) => w.panes < MAX_PANES_PER_WINDOW);
-		let paneId: string;
-		if (window) {
-			paneId = (
-				await tmux(["split-window", "-t", window.id, "-P", "-F", "#{pane_id}", "-c", cwd, command])
-			).trim();
-			await tmux(["select-layout", "-t", window.id, "tiled"]);
-		} else {
+		const locked = await lockAlloc();
+		try {
 			const name = await nextWindowName(session);
-			const [newPane = "", windowId = ""] = (
+			const paneId = (
 				await tmux([
 					"new-window",
 					"-d",
+					// Insert after the last window so the tab lands at the far right.
+					"-a",
 					"-P",
 					"-F",
-					"#{pane_id}\t#{window_id}",
+					"#{pane_id}",
 					"-t",
-					session,
+					`${session}:{end}`,
 					"-n",
 					name,
 					"-c",
 					cwd,
 					command,
 				])
-			)
-				.trim()
-				.split("\t");
-			paneId = newPane;			// Tag ownership so the extension (and future runs) only reuse its own tabs.
-			await tmux(["set-window-option", "-t", windowId, "@pi-subagents", "1"]).catch(() => {});
+			).trim();
+			// Prefix the pane title with the tab id (`_N`) so pane borders, the tab
+			// bar, and the sidebar all name the subagent the same way.
+			if (title) await tmux(["select-pane", "-t", paneId, "-T", `${name} ${title}`]).catch(() => {});
+			return paneId;
+		} finally {
+			if (locked) await tmux(["wait-for", "-U", ALLOC_LOCK]).catch(() => {});
 		}
-		if (title) await tmux(["select-pane", "-t", paneId, "-T", title]).catch(() => {});
-		return paneId;
 	});
 }
 
@@ -134,7 +124,43 @@ export async function paneExists(paneId: string): Promise<boolean> {
 	try {
 		await tmux(["list-panes", "-t", paneId, "-F", "#{pane_id}"]);
 		return true;
-	} catch {
-		return false;
+	} catch (error) {
+		// Only a definitive "no such pane" means gone; a timeout or busy server
+		// must not be reported as a crashed (but still running) child.
+		return !/can't find pane|no such pane|pane not found/i.test(error instanceof Error ? error.message : "");
 	}
+}
+
+/** Monotonic suffix so each send gets its own tmux buffer. */
+let sendSeq = 0;
+
+/** Paste a whole task into a live subagent pane as one bracketed paste, then submit it. */
+export async function sendTask(paneId: string, taskFile: string): Promise<void> {
+	// tmux buffers are server-global, so a shared default buffer could be
+	// overwritten or deleted by a concurrent send; use a unique name.
+	const buffer = `pi-subagents-${process.pid}-${++sendSeq}`;
+	await tmux(["load-buffer", "-b", buffer, taskFile]);
+	try {
+		// `-p` wraps the buffer in bracketed-paste codes so the TUI receives the
+		// whole task as one paste. Without it tmux replaces each LF with CR (Enter)
+		// and every line is submitted as its own message.
+		await tmux(["paste-buffer", "-p", "-b", buffer, "-t", paneId]);
+	} finally {
+		await tmux(["delete-buffer", "-b", buffer]).catch(() => undefined);
+	}
+	// Let the TUI ingest the paste before submitting.
+	await new Promise((resolve) => setTimeout(resolve, 150));
+	await tmux(["send-keys", "-t", paneId, "Enter"]);
+}
+
+/** Switch the current client to the pane's window and make it active. */
+export async function focusPane(paneId: string): Promise<void> {
+	const [session = "", window = ""] = (
+		await tmux(["display-message", "-p", "-t", paneId, "#{session_id}\t#{window_id}"]).catch(() => "")
+	)
+		.trim()
+		.split("\t");
+	if (session) await tmux(["switch-client", "-t", session]).catch(() => undefined);
+	if (window) await tmux(["select-window", "-t", window]).catch(() => undefined);
+	await tmux(["select-pane", "-t", paneId]).catch(() => undefined);
 }

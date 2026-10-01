@@ -4,7 +4,7 @@ Extensions for the [Pi coding agent](https://pi.dev).
 
 | Extension | What it does |
 | --- | --- |
-| [pi-subagents](extensions/pi-subagents/README.md) | tmux-native subagents: `subagent` tool + `/agent:<name>` commands, 4 tiled panes per tab |
+| [pi-subagents](extensions/pi-subagents/README.md) | tmux-native subagents: `subagent` tool + `/agent:<name>` commands, one `_N` tmux window per run |
 | [pi-sidebar](extensions/pi-sidebar/README.md) | Docked process panel that reflows the transcript (`Ctrl+Shift+S`, `/sidebar`) |
 | [pi-title](extensions/pi-title/README.md) | Generates session titles from the first exchange (`/title`) |
 | [pi-notify](extensions/pi-notify/README.md) | macOS notifications when a session finishes or needs attention |

@@ -35,15 +35,6 @@ import {
 /** Wait this long after the first user message before auto-titling. */
 const AUTO_TITLE_DELAY_MS = 60_000;
 
-/**
- * Subagents spawned by pi-subagents export their agent name, so titles stay
- * attributable (`[agent:reviewer] Fix the loader`) even when regenerated.
- */
-function withAgentTag(title: string): string {
-	const agent = process.env.PI_AGENTS_AGENT?.replace(/[^A-Za-z0-9._-]/g, "").slice(0, 32);
-	return agent && !title.startsWith(`[agent:${agent}]`) ? `[agent:${agent}] ${title}` : title;
-}
-
 export default function (pi: ExtensionAPI) {
 	const config = readConfig();
 	let generating = false;
@@ -91,9 +82,8 @@ export default function (pi: ExtensionAPI) {
 			title = cleanTitle(textOf(response.content), config.maxLength);
 		}
 		if (!title) throw new Error(`no usable title text: ${describeResponse(model, response, maxTokens)}`);
-		const named = withAgentTag(title);
-		pi.setSessionName(named);
-		return named;
+		pi.setSessionName(title);
+		return title;
 	}
 
 	/** Runs after the delay; bails if the session changed, was named, or is busy. */
@@ -175,9 +165,8 @@ export default function (pi: ExtensionAPI) {
 					notify(ctx, "Usage: /title set <text>", "error");
 					return;
 				}
-				const named = withAgentTag(tail);
-				pi.setSessionName(named);
-				notify(ctx, `Title set: ${named}`);
+				pi.setSessionName(tail);
+				notify(ctx, `Title set: ${tail}`);
 				return;
 			}
 			if (head === "model") {
@@ -216,8 +205,8 @@ export default function (pi: ExtensionAPI) {
 				notify(ctx, `${settingsPath} · custom.title ${JSON.stringify(config)} (read at session start)`);
 				return;
 			}
-			pi.setSessionName(withAgentTag(input));
-			notify(ctx, `Title set: ${withAgentTag(input)}`);
+			pi.setSessionName(input);
+			notify(ctx, `Title set: ${input}`);
 		},
 	});
 }
