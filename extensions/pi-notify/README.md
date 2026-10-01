@@ -1,4 +1,4 @@
-# pi-notify-macos
+# pi-notify
 
 macOS notifications for the Pi coding agent.
 
@@ -6,15 +6,15 @@ macOS notifications for the Pi coding agent.
 - `ui_prompt_start` sends "needs attention" when a blocking prompt appears.
 
 The notification title uses the project folder name so you know which window
-finished. Only interactive sessions (TUI/RPC) notify; headless print/SDK runs
-stay silent.
+finished. Only interactive sessions (TUI/RPC) notify; headless print/SDK runs do
+not.
 
 ## Install
 
 ```sh
-pi install npm:@rsaran/pi-notify-macos
+pi install npm:@rsaran/pi-notify
 # or locally
-pi install ./extensions/notify-macos
+pi install ./extensions/pi-notify
 ```
 
 macOS only.

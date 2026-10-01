@@ -1,4 +1,4 @@
-# pi-agents: tmux-native subagents for pi
+# pi-subagents: tmux-native subagents for pi
 
 ## Purpose
 
@@ -11,7 +11,7 @@ Everything else (usage, session management) is secondary.
 
 ## tmux model
 
-- Run only in the current tmux session (here: `pi-agents`). Never create or
+- Run only in the current tmux session (here: `pi-subagents`). Never create or
   attach to other sessions.
 - Session name/pane target comes from `$TMUX` +
   `tmux display-message -p '#{session_name}'`.
@@ -24,9 +24,9 @@ Everything else (usage, session management) is secondary.
 
 - Interactive TUI has an input box. Rejected.
 - `-p` text mode prints only the final text, nothing while running.
-  Useless for observability (verified in a real TTY).
-- Therefore `pi --mode json -p` runs in each pane. Streams events live, exits
-  when done, no input box.
+  It is useless for observability (verified in a real TTY).
+- Therefore `pi --mode json -p` runs in each pane. It streams events live, exits
+  when done, and has no input box.
 
 Pane rendering:
 
@@ -58,12 +58,12 @@ Pane rendering:
   `tmux set-window-option remain-on-exit on` (or run a shell that sleeps) plus a
   detached `sleep 600 && tmux kill-pane -t <pane>`.
 - Parent abort (Ctrl+C) kills the child panes.
-- Empty/killed panes are reused for later subagents if convenient.
+- Reuse empty/killed panes for later subagents if convenient.
 
 ## Components
 
 ```
-pi-agents/
+pi-subagents/
   index.ts      # extension entry: `subagent` tool + /agents commands
   agents.ts     # agent definition discovery + frontmatter
   tmux.ts       # current-session pane/window management (split, tile, kill)
@@ -111,9 +111,9 @@ No `model` means inherit the dispatching session's model/thinking level.
 ## Safety & edge cases
 
 - If `$TMUX` is unset, fail with a clear message (this extension is tmux-only by design).
-- Project-local agents gated behind project trust.
-- Never touch panes/windows that are not ours (identify by window name prefix).
-- Preserve the user's existing pane layout; only mutate our own tabs.
+- The extension loads project-local agents only for trusted projects.
+- Never touch panes/windows the extension does not own (identify by window name prefix).
+- Preserve the user's existing pane layout; only mutate its own tabs.
 
 ## Open decisions
 
@@ -122,7 +122,7 @@ No `model` means inherit the dispatching session's model/thinking level.
 2. **Sessions**: `--no-session` (ephemeral) vs `--session-id <id>` (resumable /
    inspectable later)?
 3. **Agents dir**: reuse `~/.pi/agent/agents/` (recommended) vs
-   `~/.pi/agent/pi-agents/agents/`.
+   `~/.pi/agent/pi-subagents/agents/`.
 4. **Persistence timer**: default 10 minutes. Configurable per agent?
 5. **Overflow**: open a new tab per 4 tasks (recommended) vs cap at 4.
 

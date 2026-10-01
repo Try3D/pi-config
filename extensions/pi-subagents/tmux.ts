@@ -1,9 +1,9 @@
 /**
- * tmux primitives for pi-agents.
+ * tmux pane operations for pi-subagents.
  *
  * Strictly uses the CURRENT tmux session. Subagents share tabs of up to
  * MAX_PANES_PER_WINDOW tiled panes each; overflow opens the next tab. Owned
- * windows carry the `@pi-agents` user option, so the extension never takes over
+ * windows carry the `@pi-subagents` user option, so the extension never takes over
  * a user window named `agents`.
  */
 
@@ -39,7 +39,7 @@ async function listAgentWindows(session: string): Promise<WindowInfo[]> {
 		"-t",
 		session,
 		"-F",
-		"#{window_id}\t#{window_name}\t#{window_panes}\t#{@pi-agents}",
+		"#{window_id}\t#{window_name}\t#{window_panes}\t#{@pi-subagents}",
 	]);
 	return out
 		.split("\n")
@@ -60,9 +60,8 @@ async function nextWindowName(session: string): Promise<string> {
 }
 
 // Serialize allocation so concurrent subagent calls can't race past the cap.
-// Per-process only: concurrent pi processes each have their own lock and can
-// still collectively exceed MAX_PANES_PER_WINDOW (best-effort, fine for the
-// 4-per-tab tiling which just re-wraps to the next window).
+// This lock lives in one process, so separate pi processes can still exceed
+// MAX_PANES_PER_WINDOW together. The extra panes wrap to the next window.
 let allocation: Promise<unknown> = Promise.resolve();
 function withLock<T>(fn: () => Promise<T>): Promise<T> {
 	const run = allocation.then(fn, fn);
@@ -115,7 +114,7 @@ export async function acquirePane(options: {
 				.trim()
 				.split("\t");
 			paneId = newPane;			// Tag ownership so the extension (and future runs) only reuse its own tabs.
-			await tmux(["set-window-option", "-t", windowId, "@pi-agents", "1"]).catch(() => {});
+			await tmux(["set-window-option", "-t", windowId, "@pi-subagents", "1"]).catch(() => {});
 		}
 		if (title) await tmux(["select-pane", "-t", paneId, "-T", title]).catch(() => {});
 		return paneId;

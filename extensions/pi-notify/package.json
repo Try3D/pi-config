@@ -1,15 +1,15 @@
 {
-  "name": "@rsaran/pi-notify-macos",
+  "name": "@rsaran/pi-notify",
   "version": "0.1.0",
   "description": "macOS notifications for the Pi coding agent",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rsaran/pi-extensions.git",
-    "directory": "extensions/notify-macos"
+    "url": "git+https://github.com/Try3D/pi-config.git",
+    "directory": "extensions/pi-notify"
   },
-  "homepage": "https://github.com/rsaran/pi-extensions#notify-macos",
+  "homepage": "https://github.com/Try3D/pi-config#pi-notify",
   "keywords": ["pi-package", "pi-extension", "notifications", "macos"],
   "engines": {
     "node": ">=22.19.0"

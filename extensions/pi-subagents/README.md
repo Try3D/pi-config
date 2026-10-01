@@ -1,4 +1,4 @@
-# pi-agents
+# pi-subagents
 
 tmux-native subagents for the [Pi coding agent](https://pi.dev).
 
@@ -10,9 +10,9 @@ summary.
 ## Install
 
 ```sh
-pi install npm:@rsaran/pi-agents
+pi install npm:@rsaran/pi-subagents
 # or locally from this repo
-pi install ./extensions/pi-agents
+pi install ./extensions/pi-subagents
 ```
 
 Requires tmux and pi running inside a tmux session.
@@ -52,18 +52,22 @@ System prompt for the agent.
 - Any new `.md` becomes `/agent:<name>` after a session restart or `/reload`.
 - Omit `model` to inherit the dispatching session's model and thinking level.
 - Omit `tools` for full capabilities; otherwise the child only gets the listed tools.
-- Project agents override same-named user agents; the override is reported at startup.
+- Project agents override same-named user agents; pi-subagents reports the override at startup.
 
 ## How it works
 
-- Spawns `pi --mode json -p --session-id <id>` in a tmux pane via a generated `run.sh`.
+- Spawns `pi --mode json -p --session-id <id> --name "[agent:<name>] <task>"` in a
+  tmux pane via a generated `run.sh`. Naming the child up front makes subagent
+  sessions identifiable in `/resume`, the tmux pane, and the sidebar; the child
+  also gets `PI_AGENTS_AGENT=<name>`, which the `title` extension uses to keep the
+  `[agent:<name>]` prefix if the title is regenerated.
 - Raw events stream to `raw.jsonl`; the pane shows a `jq`-formatted view when
   `jq` is installed, and the raw JSON stream otherwise.
 - The parent waits on an `exit` sentinel, then reads the last assistant message
   and `git status` / `git diff --stat` from the run cwd.
 - Panes persist for 10 minutes after exit, then self-clean. Aborting a tool run
-  kills the child pane; `/agent:<name>` command runs are aborted on session
-  shutdown. A closed pane is detected within a few seconds.
+  kills the child pane; session shutdown aborts `/agent:<name>` command runs, and
+  the extension notices a closed pane within a few seconds.
 
 ## Security
 

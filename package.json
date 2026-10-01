@@ -7,7 +7,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rsaran/pi-extensions.git"
+    "url": "git+https://github.com/Try3D/pi-config.git"
   },
   "keywords": [
     "pi-package",
@@ -27,11 +27,15 @@
     "@earendil-works/pi-tui": "*",
     "@eslint/js": "^10.0.1",
     "@types/node": "^22",
+    "@types/pg": "^8.11.10",
     "eslint": "^10.11.0",
     "knip": "^6.39.0",
     "typebox": "*",
     "typescript": "^5.9",
     "typescript-eslint": "^8.71.0"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
@@ -40,10 +44,11 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/pi-agents/index.ts",
-      "./extensions/sidebar/index.ts",
-      "./extensions/title/index.ts",
-      "./extensions/notify-macos/index.ts"
+      "./extensions/pi-subagents/index.ts",
+      "./extensions/pi-sidebar/index.ts",
+      "./extensions/pi-title/index.ts",
+      "./extensions/pi-notify/index.ts",
+      "./extensions/pi-pg-export/index.ts"
     ]
   }
 }

@@ -4,23 +4,24 @@ Extensions for the [Pi coding agent](https://pi.dev).
 
 | Extension | What it does |
 | --- | --- |
-| [pi-agents](extensions/pi-agents/README.md) | tmux-native subagents: `subagent` tool + `/agent:<name>` commands, 4 tiled panes per tab |
-| [sidebar](extensions/sidebar/README.md) | Docked info panel that reflows the transcript (`Ctrl+Shift+S`, `/sidebar`) |
-| [title](extensions/title/README.md) | Generates session titles from the first exchange (`/title`) |
-| [notify-macos](extensions/notify-macos/README.md) | macOS notifications when a session finishes or needs attention |
+| [pi-subagents](extensions/pi-subagents/README.md) | tmux-native subagents: `subagent` tool + `/agent:<name>` commands, 4 tiled panes per tab |
+| [pi-sidebar](extensions/pi-sidebar/README.md) | Docked process panel that reflows the transcript (`Ctrl+Shift+S`, `/sidebar`) |
+| [pi-title](extensions/pi-title/README.md) | Generates session titles from the first exchange (`/title`) |
+| [pi-notify](extensions/pi-notify/README.md) | macOS notifications when a session finishes or needs attention |
+| [pi-pg-export](extensions/pi-pg-export/README.md) | Exports interactive pi sessions to Postgres for auditability |
 
 ## Install
 
 Everything:
 
 ```sh
-pi install git:github.com/rsaran/pi-extensions
+pi install git:github.com/Try3D/pi-config
 ```
 
 One local extension while developing:
 
 ```sh
-pi -e ./extensions/pi-agents/index.ts
+pi -e ./extensions/pi-subagents/index.ts
 ```
 
 ## Development

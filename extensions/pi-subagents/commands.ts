@@ -35,7 +35,7 @@ export function abortActiveRuns(): void {
 }
 
 async function executeAgent(pi: ExtensionAPI, agent: AgentConfig, task: string, ctx: ExtensionContext): Promise<RunResult> {
-	if (ctx.hasUI) ctx.ui.setStatus("pi-agents", `Running ${agent.name}...`);
+	if (ctx.hasUI) ctx.ui.setStatus("pi-subagents", `Running ${agent.name}...`);
 	const controller = new AbortController();
 	activeRuns.add(controller);
 	try {
@@ -43,7 +43,7 @@ async function executeAgent(pi: ExtensionAPI, agent: AgentConfig, task: string, 
 		if (result.timedOut || result.exitCode !== 0) throw new Error(failureText(agent, result));
 		pi.sendMessage(
 			{
-				customType: "pi-agents",
+				customType: "pi-subagents",
 				content: `**${agent.name}** (${agent.source})\n\n${resultText(result)}`,
 				display: true,
 				details: { agent: agent.name, paneId: result.paneId, changes: result.changes },
@@ -53,7 +53,7 @@ async function executeAgent(pi: ExtensionAPI, agent: AgentConfig, task: string, 
 		return result;
 	} finally {
 		activeRuns.delete(controller);
-		if (ctx.hasUI) ctx.ui.setStatus("pi-agents", undefined);
+		if (ctx.hasUI) ctx.ui.setStatus("pi-subagents", undefined);
 	}
 }
 

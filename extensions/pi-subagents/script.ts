@@ -41,12 +41,17 @@ export function piInvocation(): { command: string; prefixArgs: string[] } {
 	return { command: process.execPath, prefixArgs: [] };
 }
 
-export function buildRunScript(runDir: string, cwd: string, command: string, args: string[]): string {
+/** Env var the child (and the title extension inside it) reads to tag its session. */
+const AGENT_ENV_VAR = "PI_AGENTS_AGENT";
+
+export function buildRunScript(runDir: string, cwd: string, command: string, args: string[], agentName: string): string {
 	const cmdLine = [command, ...args].map(shellQuote).join(" ");
 	const exitPath = shellQuote(path.join(runDir, "exit"));
 	const script = [
 		"#!/usr/bin/env bash",
 		"set -o pipefail",
+		// Lets the child's title extension keep the `[agent:<name>]` prefix.
+		`export ${AGENT_ENV_VAR}=${shellQuote(agentName)}`,
 		// Write the sentinel on a bad cwd too, or the parent polls the full timeout
 		// for an exit file that will never be written.
 		`cd ${shellQuote(cwd)} || { echo 1 > ${exitPath}; exit 1; }`,

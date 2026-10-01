@@ -69,14 +69,14 @@ export async function runSubagent(options: {
 	const cwd = options.cwd ?? ctx.cwd;
 
 	if (!process.env.TMUX) {
-		throw new Error("pi-agents requires tmux ($TMUX is not set). Run pi inside a tmux session.");
+		throw new Error("pi-subagents requires tmux ($TMUX is not set). Run pi inside a tmux session.");
 	}
 	if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) {
 		throw new Error(`Subagent cwd does not exist or is not a directory: ${cwd}`);
 	}
 
 	const runId = `${safeRunName(agent.name)}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
-	const runDir = path.join(getAgentDir(), "pi-agents", "runs", runId);
+	const runDir = path.join(getAgentDir(), "pi-subagents", "runs", runId);
 	fs.mkdirSync(runDir, { recursive: true });
 	pruneRuns(path.dirname(runDir));
 
@@ -88,6 +88,9 @@ export async function runSubagent(options: {
 	// Build pi args
 	const { command, prefixArgs } = piInvocation();
 	const args: string[] = [...prefixArgs, "--mode", "json", "-p", "--session-id", runId];
+	// Name the child instantly so its session is identifiable everywhere (resume,
+	// sidebar, tmux). Title generation also reads the exported agent env var.
+	args.push("--name", `[agent:${agent.name}] ${task.replace(/\s+/g, " ").trim().slice(0, 60)}`.trim());
 	if (agent.model) {
 		args.push("--model", agent.model);
 	} else if (ctx.model) {
@@ -98,7 +101,7 @@ export async function runSubagent(options: {
 	if (prompt) args.push("--append-system-prompt", promptPath);
 	args.push(`Task: ${task}`);
 
-	const scriptPath = buildRunScript(runDir, cwd, command, args);
+	const scriptPath = buildRunScript(runDir, cwd, command, args, agent.name);
 
 	const session = await currentSession();
 	const paneId = await acquirePane({ session, cwd, scriptPath, title: `pi:${agent.name}` });

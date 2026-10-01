@@ -1,23 +1,18 @@
 /**
  * Pure formatting/parsing helpers: ps `etime` values, terminal-title session
- * names, session heuristics, pi install roots, and terminal-style path display.
+ * names, session heuristics, and workspace grouping.
  */
 
-import { basename, sep } from "node:path";
+import { basename } from "node:path";
 import type { SessionInfo } from "@earendil-works/pi-coding-agent";
 
-export function homePath(cwd: string): string {
-	const home = process.env.HOME;
-	return home && (cwd === home || cwd.startsWith(home + sep)) ? `~${cwd.slice(home.length)}` : cwd;
-}
-
-/** Compact an `etime` value ([[dd-]hh:]mm:ss) into `6d 19h`, `2h 29m`, or `5m`. */
+/** Compact an `etime` value ([[dd-]hh:]mm:ss) to a single unit: `6d`, `2h`, or `5m`. */
 export function shortElapsed(etime: string): string {
 	const match = etime.match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):\d+$/);
 	if (!match) return etime;
 	const [, days, hours, minutes] = match;
-	if (days) return `${days}d ${hours ?? "0"}h`;
-	if (hours) return `${hours}h ${minutes}m`;
+	if (days) return `${days}d`;
+	if (hours) return `${hours}h`;
 	return `${minutes}m`;
 }
 
@@ -51,15 +46,6 @@ export function pickSessionInfo(sessions: SessionInfo[], startMs: number, paneNa
 	const prior = sessions.filter((session) => session.created.getTime() <= startMs + 2000);
 	const pool = prior.length > 0 ? prior : sessions;
 	return pool.reduce((a, b) => (b.created.getTime() > a.created.getTime() ? b : a));
-}
-
-/** Extract the pi install root from an open path under the pi package. */
-export function piRoot(path: string): string | undefined {
-	for (const marker of ["/@earendil-works/pi-coding-agent", "/@mariozechner/pi-coding-agent"]) {
-		const index = path.indexOf(marker);
-		if (index !== -1) return path.slice(0, index + marker.length);
-	}
-	return undefined;
 }
 
 /** Short label for a process group heading (basename, sorted last when unknown). */

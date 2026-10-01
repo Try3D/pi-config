@@ -1,5 +1,5 @@
 /**
- * Agent definition discovery for pi-agents.
+ * Agent definition discovery for pi-subagents.
  *
  * Agents are markdown files with YAML frontmatter:
  *
@@ -66,7 +66,7 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 		if (!entry.name.endsWith(".md")) continue;
 		if (
 			!entry.isFile() &&
-			!entry.isSymbolicLink() // symlink targets are accepted; unreadable ones are skipped below
+			!entry.isSymbolicLink() // accept symlink targets; unreadable ones are skipped below
 		)
 			continue;
 
@@ -132,10 +132,10 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentConfig[] {
 		map.set(a.name, a); // project overrides on "both"
 	}
 	if (overridden.length > 0) {
-		// Warn about overrides: the winning definition is usually intentional, but
-		// two agents sharing a name and behaving differently is confusing.
+		// Two agents sharing a name but behaving differently is confusing, so warn
+		// about overrides even when the later definition is intended.
 		console.warn(
-			`[pi-agents] duplicate agent names ignored (later definition wins): ${overridden.join(", ")}`,
+			`[pi-subagents] duplicate agent names ignored (later definition wins): ${overridden.join(", ")}`,
 		);
 	}
 	return Array.from(map.values());

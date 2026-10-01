@@ -13,12 +13,13 @@
  * `/title on|off`          enable/disable automatic titles
  * `/title config`          show the effective configuration
  *
- * Config file: `~/.pi/agent/title.json`. See config.ts. Module split:
+ * Config lives under `custom.title` in `~/.pi/agent/settings.json`. See
+ * config.ts. Module split:
  * config.ts (persistence), models.ts (model resolution), exchange.ts (prompting).
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { logTitleError, logPath, readConfig, configPath, writeConfig } from "./config.ts";
+import { logTitleError, logPath, readConfig, settingsPath, writeConfig } from "./config.ts";
 import { cleanTitle, clipExchange, describeResponse, firstExchange, neutralizeDelimiters, SYSTEM_PROMPT, textOf } from "./exchange.ts";
 import {
 	effortOptions,
@@ -33,6 +34,15 @@ import {
 
 /** Wait this long after the first user message before auto-titling. */
 const AUTO_TITLE_DELAY_MS = 60_000;
+
+/**
+ * Subagents spawned by pi-subagents export their agent name, so titles stay
+ * attributable (`[agent:reviewer] Fix the loader`) even when regenerated.
+ */
+function withAgentTag(title: string): string {
+	const agent = process.env.PI_AGENTS_AGENT?.replace(/[^A-Za-z0-9._-]/g, "").slice(0, 32);
+	return agent && !title.startsWith(`[agent:${agent}]`) ? `[agent:${agent}] ${title}` : title;
+}
 
 export default function (pi: ExtensionAPI) {
 	const config = readConfig();
@@ -50,8 +60,8 @@ export default function (pi: ExtensionAPI) {
 		const { model, thinkingLevel } = resolveModel(ctx, config);
 		const exchange = firstExchange(ctx.sessionManager.buildContextEntries());
 		if (!exchange) throw new Error("nothing to title yet; send a message first");
-		// The request/response halves are untrusted: clip them and strip our own
-		// data tags so the model cannot be tricked into leaving the data section.
+		// The request/response halves are untrusted, so clip them and strip our own
+		// data tags to stop the model from leaving the data section.
 		const user = neutralizeDelimiters(clipExchange(exchange.user));
 		const reply = exchange.assistant ? neutralizeDelimiters(clipExchange(exchange.assistant)) : "";
 		const content = `<request>\n${user}\n</request>` + (reply ? `\n\n<response>\n${reply}\n</response>` : "");
@@ -81,8 +91,9 @@ export default function (pi: ExtensionAPI) {
 			title = cleanTitle(textOf(response.content), config.maxLength);
 		}
 		if (!title) throw new Error(`no usable title text: ${describeResponse(model, response, maxTokens)}`);
-		pi.setSessionName(title);
-		return title;
+		const named = withAgentTag(title);
+		pi.setSessionName(named);
+		return named;
 	}
 
 	/** Runs after the delay; bails if the session changed, was named, or is busy. */
@@ -164,8 +175,9 @@ export default function (pi: ExtensionAPI) {
 					notify(ctx, "Usage: /title set <text>", "error");
 					return;
 				}
-				pi.setSessionName(tail);
-				notify(ctx, `Title set: ${tail}`);
+				const named = withAgentTag(tail);
+				pi.setSessionName(named);
+				notify(ctx, `Title set: ${named}`);
 				return;
 			}
 			if (head === "model") {
@@ -185,7 +197,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				config.model = value;
 				if (!writeConfig(config)) {
-					notify(ctx, `Could not write ${configPath} (logged to ${logPath})`, "error");
+					notify(ctx, `Could not write ${settingsPath} (logged to ${logPath})`, "error");
 					return;
 				}
 				notify(ctx, `Title model: ${value ?? "active (session model)"}`);
@@ -194,18 +206,18 @@ export default function (pi: ExtensionAPI) {
 			if (head === "on" || head === "off") {
 				config.enabled = head === "on";
 				if (!writeConfig(config)) {
-					notify(ctx, `Could not write ${configPath} (logged to ${logPath})`, "error");
+					notify(ctx, `Could not write ${settingsPath} (logged to ${logPath})`, "error");
 					return;
 				}
 				notify(ctx, `Automatic titles ${config.enabled ? "enabled" : "disabled"}`);
 				return;
 			}
 			if (head === "config") {
-				notify(ctx, `${configPath} · ${JSON.stringify(config)} (read at session start)`);
+				notify(ctx, `${settingsPath} · custom.title ${JSON.stringify(config)} (read at session start)`);
 				return;
 			}
-			pi.setSessionName(input);
-			notify(ctx, `Title set: ${input}`);
+			pi.setSessionName(withAgentTag(input));
+			notify(ctx, `Title set: ${withAgentTag(input)}`);
 		},
 	});
 }

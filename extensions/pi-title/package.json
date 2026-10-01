@@ -6,10 +6,10 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rsaran/pi-extensions.git",
-    "directory": "extensions/title"
+    "url": "git+https://github.com/Try3D/pi-config.git",
+    "directory": "extensions/pi-title"
   },
-  "homepage": "https://github.com/rsaran/pi-extensions#title",
+  "homepage": "https://github.com/Try3D/pi-config#pi-title",
   "keywords": ["pi-package", "pi-extension", "title", "session"],
   "engines": {
     "node": ">=22.19.0"

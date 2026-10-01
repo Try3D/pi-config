@@ -1,0 +1,27 @@
+{
+  "name": "@rsaran/pi-pg-export",
+  "version": "0.1.0",
+  "description": "Export interactive pi sessions to Postgres for auditability",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Try3D/pi-config.git",
+    "directory": "extensions/pi-pg-export"
+  },
+  "homepage": "https://github.com/Try3D/pi-config#pi-pg-export",
+  "keywords": ["pi-package", "pi-extension", "postgres", "audit", "export"],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": ["*.ts", "README.md"],
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}

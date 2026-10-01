@@ -1,5 +1,5 @@
 /**
- * pi-agents: tmux-native subagents for pi.
+ * pi-subagents: tmux-native subagents for pi.
  *
  * - `subagent` tool: the LLM can delegate a task to a named agent.
  * - `/agent:<name> <task>` commands: the human can directly run a named agent.

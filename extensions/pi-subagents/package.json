@@ -1,15 +1,15 @@
 {
-  "name": "@rsaran/pi-agents",
+  "name": "@rsaran/pi-subagents",
   "version": "0.1.0",
   "description": "tmux-native subagents for the Pi coding agent",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rsaran/pi-extensions.git",
-    "directory": "extensions/pi-agents"
+    "url": "git+https://github.com/Try3D/pi-config.git",
+    "directory": "extensions/pi-subagents"
   },
-  "homepage": "https://github.com/rsaran/pi-extensions#pi-agents",
+  "homepage": "https://github.com/Try3D/pi-config#pi-subagents",
   "keywords": ["pi-package", "pi-extension", "subagent", "tmux"],
   "engines": {
     "node": ">=22.19.0"

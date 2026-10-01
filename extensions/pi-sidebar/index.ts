@@ -1,5 +1,5 @@
 /**
- * Sidebar: a docked info panel that reflows the transcript instead of covering it.
+ * Sidebar: a docked process panel that reflows the transcript instead of covering it.
  *
  * Pi's regular TUI has no sidebar region, so in fullscreen mode this wraps the
  * renderer's layout root in an `HStack`:
@@ -18,6 +18,7 @@
  * `/sidebar`            toggle visibility
  * `/sidebar left|right` move it
  * `/sidebar on|off`     explicit show/hide
+ * `/sidebar width [n]`  show or set the docked column width (columns)
  * `/sidebar reload`     send /reload to every pi pane in tmux
  * `ctrl+shift+s`        toggle visibility
  *
@@ -29,13 +30,14 @@
  * to the session's first user message.
  *
  * Each process publishes its own status to `~/.pi/agent/sidebar/<pid>.json`
- * (label, cwd, model, branch, tmux pane). Every sidebar watches that directory,
- * so a change anywhere (a title, a model switch, a new pane) live-updates all
- * running sidebars; ps decides which pids exist.
+ * (label, cwd, tmux pane, streaming). Every sidebar watches that directory,
+ * so a change anywhere (a title, a new pane) live-updates all running
+ * sidebars; ps decides which pids exist.
  *
- * Module split: types.ts (constants + shared types), format.ts (pure
- * formatting/parsing), component.ts (the panel TUI component), footer.ts
- * (session-name-quiet footer), index.ts (lifecycle, discovery, commands).
+ * Module split: types.ts (constants + shared types), config.ts (width
+ * persistence), format.ts (pure formatting/parsing), component.ts (the panel TUI
+ * component), footer.ts (session-name-quiet footer with the context bar),
+ * index.ts (lifecycle, discovery, commands).
  */
 
 import {
@@ -52,7 +54,6 @@ import { mkdir, readFile, readdir, readlink, unlink, writeFile } from "node:fs/p
 import { basename, join } from "node:path";
 import {
 	elapsedMs,
-	piRoot,
 	pickSessionInfo,
 	processLabelFallback,
 	sanitize,
@@ -61,12 +62,18 @@ import {
 } from "./format.ts";
 import { QuietFooter } from "./footer.ts";
 import { SidebarComponent } from "./component.ts";
+import { clampLabelWidth, clampWidth, readConfig, settingsPath, writeConfig } from "./config.ts";
 import {
 	MAX_PROCESSES,
+	MAX_WIDTH,
+	MAX_LABEL_WIDTH,
+	MIN_LABEL_WIDTH,
 	MIN_TERMINAL_WIDTH,
+	MIN_WIDTH,
 	PROCESS_REFRESH_MS,
 	SHARED_DIR,
-	WIDTH,
+	SPINNER_FRAMES,
+	SPINNER_MS,
 	type ProcessItem,
 	type SharedStatus,
 	type SidebarState,
@@ -76,12 +83,9 @@ import {
 
 export default function (pi: ExtensionAPI) {
 	const state: SidebarState = {
-		model: "—",
-		thinking: "—",
 		cwd: "",
-		percent: null,
-		turns: 0,
 		streaming: false,
+		frame: 0,
 		processes: [],
 	};
 
@@ -89,10 +93,15 @@ export default function (pi: ExtensionAPI) {
 	let tui: TUI | undefined;
 	let overlay: OverlayHandle | undefined;
 	let overlaySide: Side | undefined;
+	let overlayWidth: number | undefined;
 	let originalRoot: Component | undefined;
 	let wrapped: Component | undefined;
 	let wrappedSide: Side | undefined;
+	let wrappedWidth: number | undefined;
 	let lastTheme: Theme | undefined;
+	const config = readConfig();
+	let width = config.width;
+	let labelWidth = config.labelWidth;
 	let side: Side = "left";
 	let visible = true;
 
@@ -108,14 +117,15 @@ export default function (pi: ExtensionAPI) {
 		await pi.exec("tmux", ["select-pane", "-t", tmux.pane]).catch(() => undefined);
 	};
 
-	const makeSidebar = () => new SidebarComponent(() => state, theme, height, () => side, (pid) => void focusProcess(pid));
+	const makeSidebar = () =>
+		new SidebarComponent(() => state, theme, height, () => side, () => labelWidth, (pid) => void focusProcess(pid));
 
 	const buildWrapped = (root: Component): Component => {
 		const panel: StackEntry = {
 			component: makeSidebar(),
-			basis: WIDTH,
-			minSize: WIDTH,
-			maxSize: WIDTH,
+			basis: width,
+			minSize: width,
+			maxSize: width,
 			shrink: 0,
 			visible: (viewport) => viewport.width >= MIN_TERMINAL_WIDTH,
 		};
@@ -125,7 +135,7 @@ export default function (pi: ExtensionAPI) {
 
 	const overlayOptions = (): OverlayOptions => ({
 		anchor: side === "right" ? "top-right" : "top-left",
-		width: WIDTH,
+		width,
 		maxHeight: "100%",
 		margin: { top: 0, bottom: 0, right: side === "right" ? 1 : 0, left: side === "left" ? 1 : 0 },
 		nonCapturing: true,
@@ -136,6 +146,7 @@ export default function (pi: ExtensionAPI) {
 		if (!tui || overlay) return;
 		overlay = tui.showOverlay(makeSidebar(), overlayOptions());
 		overlaySide = side;
+		overlayWidth = width;
 	};
 
 	/**
@@ -164,9 +175,10 @@ export default function (pi: ExtensionAPI) {
 			if (!originalRoot && current) originalRoot = current;
 			if (current && current !== wrapped && current !== originalRoot) return;
 			if (!originalRoot) return;
-			if (!wrapped || wrappedSide !== side) {
+			if (!wrapped || wrappedSide !== side || wrappedWidth !== width) {
 				wrapped = buildWrapped(originalRoot);
 				wrappedSide = side;
+				wrappedWidth = width;
 			}
 			tui.setLayoutRoot(visible ? wrapped : originalRoot);
 			return;
@@ -176,7 +188,8 @@ export default function (pi: ExtensionAPI) {
 		wrapped = undefined;
 		originalRoot = undefined;
 		wrappedSide = undefined;
-		if (overlay && overlaySide !== side) {
+		wrappedWidth = undefined;
+		if (overlay && (overlaySide !== side || overlayWidth !== width)) {
 			overlay.hide();
 			overlay = undefined;
 		}
@@ -194,21 +207,33 @@ export default function (pi: ExtensionAPI) {
 			originalRoot = undefined;
 			wrapped = undefined;
 			wrappedSide = undefined;
+			wrappedWidth = undefined;
 		}
+		ensureAnimation();
 		void publishSelf();
 	};
 
 	let timer: ReturnType<typeof setInterval> | undefined;
+	let animTimer: ReturnType<typeof setInterval> | undefined;
 	/** Set by session_shutdown so in-flight async work cannot resurrect state. */
 	let shuttingDown = false;
 
+	/** Run the spinner only while something is streaming and the panel is visible. */
+	const ensureAnimation = () => {
+		const busy = visible && (state.streaming || state.processes.some((item) => item.streaming));
+		if (busy && !animTimer) {
+			animTimer = setInterval(() => {
+				state.frame = (state.frame + 1) % SPINNER_FRAMES.length;
+				tui?.requestRender();
+			}, SPINNER_MS);
+		} else if (!busy && animTimer) {
+			clearInterval(animTimer);
+			animTimer = undefined;
+		}
+	};
+
 	const syncData = (source: ExtensionContext) => {
-		const usage = source.getContextUsage();
-		state.model = source.model?.id ?? "—";
-		state.thinking = pi.getThinkingLevel();
 		state.cwd = source.cwd;
-		state.percent = usage?.percent ?? null;
-		state.contextWindow = usage?.contextWindow;
 	};
 
 	const ownFile = join(SHARED_DIR, `${process.pid}.json`);
@@ -222,9 +247,7 @@ export default function (pi: ExtensionAPI) {
 		const signature = [
 			state.cwd,
 			pi.getSessionName() ?? "",
-			state.model,
-			state.thinking,
-			state.branch ?? "",
+			state.streaming ? "1" : "0",
 			process.env.TMUX_PANE ?? "",
 		].join("\u0000");
 		if (signature === publishedSignature) return;
@@ -234,10 +257,8 @@ export default function (pi: ExtensionAPI) {
 				pid: process.pid,
 				label: pi.getSessionName(),
 				cwd: state.cwd,
-				model: state.model,
-				thinking: state.thinking,
-				branch: state.branch,
 				pane: process.env.TMUX_PANE,
+				streaming: state.streaming,
 				updatedAt: Date.now(),
 			};
 			await writeFile(ownFile, `${JSON.stringify(status)}\n`, { mode: 0o600 });
@@ -273,10 +294,8 @@ export default function (pi: ExtensionAPI) {
 				pid: status.pid,
 				label: str(status.label),
 				cwd: str(status.cwd),
-				model: str(status.model),
-				thinking: str(status.thinking),
-				branch: str(status.branch),
 				pane: str(status.pane),
+				streaming: status.streaming === true,
 				updatedAt: typeof status.updatedAt === "number" ? status.updatedAt : 0,
 			});
 		}
@@ -303,18 +322,6 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	const versionCache = new Map<string, string | undefined>();
-	const readVersion = async (root: string): Promise<string | undefined> => {
-		if (versionCache.has(root)) return versionCache.get(root);
-		let version: string | undefined;
-		try {
-			version = (JSON.parse(await readFile(`${root}/package.json`, "utf8")) as { version?: string }).version;
-		} catch {
-			return undefined; // transient read failure: do not cache the miss
-		}
-		versionCache.set(root, version);
-		return version;
-	};
 
 	/** tmux targets keyed by pi pid (ancestry walk) and by pane id (for self-published panes). */
 	const tmuxTargets = async (
@@ -371,7 +378,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	/** List every running pi process on the machine (pid, cwd, version, uptime). */
+	/** List every running pi process on the machine (pid, cwd, uptime). */
 	const listProcesses = async (): Promise<ProcessItem[]> => {
 		let output: string;
 		try {
@@ -403,11 +410,9 @@ export default function (pi: ExtensionAPI) {
 			return /^(node|bun)$/.test(comm) && /(^|[\s/])pi(-coding-agent)?([\s/]|$)/.test(row.args);
 		});
 
-		// One lsof call for all found pids gives each process's cwd and any open
-		// file under its pi install, from which we read the running version.
+		// One lsof call for all found pids gives each process's cwd.
 		const pids = rows.map((row) => row.pid).filter(Number.isFinite);
 		const cwds = new Map<number, string>();
-		const roots = new Map<number, string>();
 		if (pids.length > 0) {
 			try {
 				const lsof = await pi.exec("lsof", ["-a", "-p", pids.join(","), "-Fn"]);
@@ -419,10 +424,6 @@ export default function (pi: ExtensionAPI) {
 					else if (line.startsWith("n") && pid !== undefined) {
 						const path = line.slice(1);
 						if (fd === "cwd") cwds.set(pid, path);
-						else if (!roots.has(pid)) {
-							const root = piRoot(path);
-							if (root) roots.set(pid, root);
-						}
 					}
 				}
 			} catch {
@@ -439,7 +440,6 @@ export default function (pi: ExtensionAPI) {
 			if (!Number.isFinite(pid)) continue;
 			const info = shared.get(pid);
 			const cwd = cwds.get(pid) ?? info?.cwd ?? (await readlink(`/proc/${pid}/cwd`).catch(() => undefined));
-			const root = roots.get(pid);
 			const tmux = (info?.pane ? byPane.get(info.pane) : undefined) ?? panes.get(pid);
 			const elapsed = elapsedMs(etime);
 			// Without a parseable start time the session heuristic would guess wrong.
@@ -450,11 +450,12 @@ export default function (pi: ExtensionAPI) {
 			items.push({
 				pid,
 				label,
-				version: root ? await readVersion(root) : undefined,
 				elapsed: shortElapsed(etime),
 				current: pid === process.pid,
 				cwd,
 				tmux,
+				// Own liveness is local state; others come from their published status.
+				streaming: pid === process.pid ? state.streaming : info?.streaming === true,
 			});
 		}
 		// Stable, machine-wide order (ascending pid) so every window lists rows
@@ -519,9 +520,15 @@ export default function (pi: ExtensionAPI) {
 			get state() {
 				return { model: ctx?.model, thinkingLevel: pi.getThinkingLevel() };
 			},
+			get model() {
+				return ctx?.model;
+			},
 			get sessionManager() {
 				return {
 					getEntries: () => ctx?.sessionManager?.getEntries() ?? [],
+					getEntryCount: () => ctx?.sessionManager?.getEntries().length ?? 0,
+					getSessionId: () => ctx?.sessionManager?.getSessionId(),
+					getLeafId: () => ctx?.sessionManager?.getLeafId() ?? null,
 					getCwd: () => ctx?.cwd ?? process.cwd(),
 					getSessionName: () => undefined,
 				};
@@ -530,7 +537,7 @@ export default function (pi: ExtensionAPI) {
 			modelRuntime: { isUsingSubscription: () => false },
 		};
 		try {
-			source.ui.setFooter((_tui, _theme, footerData) => new QuietFooter(footerData, stub));
+			source.ui.setFooter((_tui, theme, footerData) => new QuietFooter(footerData, stub, theme));
 		} catch {
 			/* fall back to the built-in footer */
 		}
@@ -541,11 +548,6 @@ export default function (pi: ExtensionAPI) {
 		ctx = source;
 		if (source.mode !== "tui") return;
 		syncData(source);
-		state.turns = 0;
-
-		const branch = await pi.exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: source.cwd }).catch(() => undefined);
-		const name = branch?.stdout.trim();
-		state.branch = name && name !== "HEAD" ? name : undefined;
 
 		await ensureTui(source);
 		installFooter(source);
@@ -566,8 +568,11 @@ export default function (pi: ExtensionAPI) {
 			clearInterval(timer);
 			timer = undefined;
 		}
+		if (animTimer) {
+			clearInterval(animTimer);
+			animTimer = undefined;
+		}
 		reloadPending = false;
-		versionCache.clear();
 		sessionCache.clear();
 		watcher?.close();
 		watcher = undefined;
@@ -591,21 +596,13 @@ export default function (pi: ExtensionAPI) {
 		overlay?.hide();
 		overlay = undefined;
 		overlaySide = undefined;
+		overlayWidth = undefined;
 		originalRoot = undefined;
 		wrapped = undefined;
 		wrappedSide = undefined;
+		wrappedWidth = undefined;
 		tui = undefined;
 		ctx = undefined;
-	});
-
-	pi.on("model_select", (_event, source) => {
-		syncData(source);
-		refresh();
-	});
-
-	pi.on("thinking_level_select", (_event, source) => {
-		syncData(source);
-		refresh();
 	});
 
 	pi.on("session_info_changed", () => {
@@ -624,13 +621,20 @@ export default function (pi: ExtensionAPI) {
 		refresh();
 	});
 
-	pi.on("turn_start", () => {
-		state.turns++;
-		refresh();
-	});
-
 	pi.registerCommand("sidebar", {
-		description: "Toggle the info sidebar; /sidebar left|right, on|off, reload",
+		description: "Toggle the sidebar; /sidebar left|right, on|off, width [n], label-width [n], reload",
+		getArgumentCompletions: (prefix) => {
+			const options = [
+				["left", "Dock the sidebar on the left"],
+				["right", "Dock the sidebar on the right"],
+				["on", "Show the sidebar"],
+				["off", "Hide the sidebar"],
+				["width", `Show or set the column width (${MIN_WIDTH}–${MAX_WIDTH})`],
+				["label-width", `Show or set the process-label width (${MIN_LABEL_WIDTH}–${MAX_LABEL_WIDTH})`],
+				["reload", "Send /reload to the other pi panes in tmux"],
+			] as const;
+			return options.filter(([value]) => value.startsWith(prefix.trim())).map(([value, description]) => ({ value, label: value, description }));
+		},
 		handler: async (args, source) => {
 			if (source.mode !== "tui") {
 				source.ui.notify("Sidebar is only available in the TUI", "error");
@@ -639,7 +643,39 @@ export default function (pi: ExtensionAPI) {
 			ctx = source;
 			await ensureTui(source);
 
-			const arg = args.trim().toLowerCase();
+			const [arg, value] = args.trim().toLowerCase().split(/\s+/);
+			if (arg === "width") {
+				if (!value) {
+					source.ui.notify(`Sidebar width: ${width} (${MIN_WIDTH}–${MAX_WIDTH})`, "info");
+					return;
+				}
+				const parsed = Number(value);
+				if (!Number.isFinite(parsed)) {
+					source.ui.notify(`Width must be a number (${MIN_WIDTH}–${MAX_WIDTH})`, "error");
+					return;
+				}
+				width = clampWidth(parsed);
+				config.width = width;
+				if (!writeConfig(config)) source.ui.notify(`Could not write ${settingsPath}`, "error");
+				refresh();
+				return;
+			}
+			if (arg === "label-width" || arg === "label") {
+				if (!value) {
+					source.ui.notify(`Label width: ${labelWidth} (${MIN_LABEL_WIDTH}–${MAX_LABEL_WIDTH})`, "info");
+					return;
+				}
+				const parsed = Number(value);
+				if (!Number.isFinite(parsed)) {
+					source.ui.notify(`Label width must be a number (${MIN_LABEL_WIDTH}–${MAX_LABEL_WIDTH})`, "error");
+					return;
+				}
+				labelWidth = clampLabelWidth(parsed);
+				config.labelWidth = labelWidth;
+				if (!writeConfig(config)) source.ui.notify(`Could not write ${settingsPath}`, "error");
+				refresh();
+				return;
+			}
 			if (arg === "reload") {
 				const targets = state.processes.filter((item): item is ProcessItem & { tmux: TmuxTarget } => Boolean(item.tmux) && !item.current);
 				await Promise.all(
@@ -666,7 +702,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerShortcut("ctrl+shift+s", {
-		description: "Toggle the info sidebar",
+		description: "Toggle the sidebar",
 		handler: async (source) => {
 			if (source.mode !== "tui") return;
 			ctx = source;

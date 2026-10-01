@@ -3,6 +3,11 @@
  * - agent_settled: "finished" when pi will not continue automatically
  * - ui_prompt_start: "needs attention" when a blocking prompt appears
  *
+ * Prompts that close within PROMPT_NOTIFY_DELAY_MS do not notify. Extensions
+ * sometimes open a no-op custom overlay just to grab a TUI handle (the sidebar
+ * does this on every session_start), which otherwise notifies on every startup,
+ * /reload, and /new.
+ *
  * Title uses the project folder name so you know which window finished.
  * Only interactive sessions (tui/rpc) notify. Headless SDK/print runs also load
  * this extension, and those produced spurious notifications from scripts like
@@ -15,7 +20,7 @@ import { basename } from "node:path";
 export default function (pi: ExtensionAPI) {
 	if (process.platform !== "darwin") return;
 
-	// Text is passed as argv, not interpolated into the script: model output can
+	// Pass text as argv, not interpolated into the script, because model output can
 	// contain quotes/backslashes and must never be parsed as AppleScript.
 	const NOTIFY_SCRIPT = 'on run argv\ndisplay notification (item 1 of argv) with title (item 2 of argv) sound name "Sosumi"\nend run';
 	const notify = (title: string, body: string) =>
@@ -55,8 +60,28 @@ export default function (pi: ExtensionAPI) {
 		notify(`π ${basename(ctx.cwd)}`, preview(lastText));
 	});
 
+	// A real blocking prompt stays open until the user acts; a throwaway overlay
+	// ends in the same tick. Debounce so only the former notifies.
+	const PROMPT_NOTIFY_DELAY_MS = 500;
+	let promptNotifyTimer: ReturnType<typeof setTimeout> | undefined;
+
 	pi.on("ui_prompt_start", (_event, ctx) => {
 		if (!isInteractive(ctx)) return;
-		notify(`π ${basename(ctx.cwd)}`, "Needs your attention");
+		const title = `π ${basename(ctx.cwd)}`;
+		clearTimeout(promptNotifyTimer);
+		promptNotifyTimer = setTimeout(() => {
+			promptNotifyTimer = undefined;
+			notify(title, "Needs your attention");
+		}, PROMPT_NOTIFY_DELAY_MS);
+	});
+
+	pi.on("ui_prompt_end", () => {
+		clearTimeout(promptNotifyTimer);
+		promptNotifyTimer = undefined;
+	});
+
+	pi.on("session_shutdown", () => {
+		clearTimeout(promptNotifyTimer);
+		promptNotifyTimer = undefined;
 	});
 }
