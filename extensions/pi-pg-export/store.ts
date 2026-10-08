@@ -8,6 +8,26 @@ export function trackerConnectionString(): string {
 	return process.env.PI_TRACKER_DATABASE_URL ?? process.env.DATABASE_URL ?? DEFAULT_CONNECTION;
 }
 
+/** Postgres text/jsonb reject NUL (0x00); drop it from a string. */
+function stripNulText(text: string): string {
+	return text.replaceAll("\u0000", "");
+}
+
+/** Deep-copy `value` with NUL removed from every string, so the JSON stays valid. */
+function stripNul(value: unknown): unknown {
+	if (typeof value === "string") return stripNulText(value);
+	if (Array.isArray(value)) return value.map(stripNul);
+	if (typeof value === "object" && value !== null) {
+		return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, stripNul(item)]));
+	}
+	return value;
+}
+
+/** Serialize a jsonb parameter after removing NUL bytes Postgres refuses to parse. */
+function jsonb(value: unknown): string {
+	return JSON.stringify(stripNul(value ?? null));
+}
+
 export interface SessionUpsert {
 	id: string;
 	fallbackId: string;
@@ -163,7 +183,7 @@ export class PgStore {
 				`update pi_tracker.sessions
 				 set message_count = $2, usage = $3::jsonb, status = $4, last_active_at = now()
 				 where id = $1`,
-				[id, messageCount, JSON.stringify(usage ?? {}), status],
+				[id, messageCount, jsonb(usage ?? {}), status],
 			);
 		});
 	}
@@ -196,7 +216,7 @@ export class PgStore {
 				`insert into pi_tracker.turns (id, session_id, seq, status, usage, llm_count, tool_count, started_at, ended_at)
 				 values ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)
 				 on conflict (session_id, seq) do nothing`,
-				[row.id, row.sessionId, row.seq, row.status, JSON.stringify(row.usage ?? {}), row.llmCount, row.toolCount, row.startedAt, row.endedAt],
+				[row.id, row.sessionId, row.seq, row.status, jsonb(row.usage ?? {}), row.llmCount, row.toolCount, row.startedAt, row.endedAt],
 			);
 		});
 	}
@@ -207,7 +227,7 @@ export class PgStore {
 				`insert into pi_tracker.entries (session_id, entry_id, parent_id, seq, type, role, occurred_at, payload)
 				 values ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
 				 on conflict do nothing`,
-				[row.sessionId, row.entryId, row.parentId, row.seq, row.type, row.role, row.occurredAt, JSON.stringify(row.payload)],
+				[row.sessionId, row.entryId, row.parentId, row.seq, row.type, row.role, row.occurredAt, jsonb(row.payload)],
 			);
 		});
 	}
@@ -228,7 +248,7 @@ export class PgStore {
 					row.model,
 					row.streamed,
 					row.stopReason,
-					JSON.stringify(row.usage ?? {}),
+					jsonb(row.usage ?? {}),
 					row.tokensIn,
 					row.tokensOut,
 					row.cacheRead,
@@ -237,7 +257,7 @@ export class PgStore {
 					row.durationMs,
 					row.ttftMs,
 					row.chunkCount,
-					JSON.stringify(row.error ?? null),
+					jsonb(row.error),
 					row.startedAt,
 					row.endedAt,
 				],
@@ -259,14 +279,14 @@ export class PgStore {
 					row.turnId,
 					row.toolCallId,
 					row.toolName,
-					JSON.stringify(row.args ?? null),
-					row.output,
-					JSON.stringify(row.outputJson ?? null),
+					jsonb(row.args),
+					row.output === null ? null : stripNulText(row.output),
+					jsonb(row.outputJson),
 					row.isError,
-					JSON.stringify(row.error ?? null),
+					jsonb(row.error),
 					row.exitCode,
 					row.durationMs,
-					JSON.stringify(row.details ?? null),
+					jsonb(row.details),
 					row.startedAt,
 					row.endedAt,
 				],
@@ -278,7 +298,7 @@ export class PgStore {
 		return this.run(async () => {
 			await this.client.query(
 				`insert into pi_tracker.events (session_id, name, attributes, occurred_at) values ($1, $2, $3::jsonb, $4)`,
-				[row.sessionId, row.name, JSON.stringify(row.attributes ?? {}), row.occurredAt],
+				[row.sessionId, row.name, jsonb(row.attributes ?? {}), row.occurredAt],
 			);
 		});
 	}

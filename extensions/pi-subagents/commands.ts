@@ -1,66 +1,16 @@
 /**
- * Human-facing commands: `/agents` lists agents and manages past runs, and
- * `/agent:<name> <task>` runs one named agent. Registration happens once per
- * process (see index.ts) because pi keeps duplicate command names and suffixes
- * them (`/agent:scout:2`).
+ * Human-facing commands: `/agents` lists agents and manages past runs,
+ * `/agent:<name> <task>` runs one named agent in the background,
+ * `/agents resume|steer <runId> <task>` sends a message to an existing run
+ * (pasted into its pane), and `/agents status <runId>` reads its result.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { discoverAgents, type AgentScope } from "./agents.ts";
-import { currentDepth, listRuns, openRunSession, resumeSubagent, runSubagent, type RunResult } from "./run.ts";
+import { cancelSubagent, currentDepth, getSubagentStatus, listRuns, openRunSession, runSubagentBackground, sendToRun, startBackgroundWatcher } from "./run.ts";
 
 export function scopeFor(ctx: { isProjectTrusted(): boolean }): AgentScope {
 	return ctx.isProjectTrusted() ? "both" : "user";
-}
-
-export function resultText(result: RunResult): string {
-	const sections: string[] = [];
-	if (result.text.trim()) sections.push(result.text.trim());
-	if (result.changes) sections.push(`Changed files:\n${result.changes}`);
-	return sections.join("\n\n") || "(no output)";
-}
-
-/** Human-readable failure for a run that did not finish cleanly. */
-export function failureText(result: RunResult): string {
-	const partial = result.text.trim() ? `\n\nPartial output:\n${result.text.trim().slice(-2000)}` : "";
-	const state = result.timedOut ? "timed out" : "failed";
-	return `Subagent "${result.agent}" ${state}.${partial}`;
-}
-
-/** Live command-triggered runs, so session shutdown can abort them. */
-const activeRuns = new Set<AbortController>();
-
-export function abortActiveRuns(): void {
-	for (const controller of activeRuns) controller.abort();
-	activeRuns.clear();
-}
-
-/** Run a controller-tracked subagent and post a follow-up message with the result. */
-async function deliver(
-	pi: ExtensionAPI,
-	ctx: ExtensionContext,
-	status: string,
-	run: (signal: AbortSignal) => Promise<RunResult>,
-): Promise<void> {
-	if (ctx.hasUI) ctx.ui.setStatus("pi-subagents", status);
-	const controller = new AbortController();
-	activeRuns.add(controller);
-	try {
-		const result = await run(controller.signal);
-		if (result.timedOut || result.status === "failed") throw new Error(failureText(result));
-		pi.sendMessage(
-			{
-				customType: "pi-subagents",
-				content: `**${result.agent}**\n\n${resultText(result)}`,
-				display: true,
-				details: { agent: result.agent, paneId: result.paneId, changes: result.changes },
-			},
-			{ deliverAs: "followUp", triggerTurn: false },
-		);
-	} finally {
-		activeRuns.delete(controller);
-		if (ctx.hasUI) ctx.ui.setStatus("pi-subagents", undefined);
-	}
 }
 
 function listRunLines(): string {
@@ -71,13 +21,18 @@ function listRunLines(): string {
 		.join("\n");
 }
 
+function formatRunIdLine(runId: string): string {
+	return `Started subagent in background.\nRun ID: ${runId}\nUse \`/agents resume ${runId} <task>\` to send a follow-up, or \`/agents status ${runId}\` to check progress.`;
+}
+
 /** Register `/agents` and one `/agent:<name>` command per discovered agent. */
 export function registerAgentCommands(pi: ExtensionAPI, source: ExtensionContext): void {
 	const scope = scopeFor(source);
 	const agents = discoverAgents(source.cwd, scope);
 
 	pi.registerCommand("agents", {
-		description: "List subagents, or manage runs: /agents runs | /agents open <runId> | /agents resume <runId> <task>",
+		description:
+			"List subagents, or manage runs: /agents runs | /agents open <runId> | /agents resume <runId> <task> | /agents steer <runId> <task> | /agents status <runId> | /agents cancel <runId>",
 		handler: async (args, cmdCtx) => {
 			const [sub, ...rest] = args.trim().split(/\s+/).filter(Boolean);
 			if (sub === "runs") {
@@ -98,17 +53,49 @@ export function registerAgentCommands(pi: ExtensionAPI, source: ExtensionContext
 				}
 				return;
 			}
-			if (sub === "resume") {
+			if (sub === "resume" || sub === "steer") {
 				const runId = rest[0];
 				const task = rest.slice(1).join(" ");
 				if (!runId || !task) {
-					cmdCtx.ui.notify("Usage: /agents resume <runId> <task>", "error");
+					cmdCtx.ui.notify(`Usage: /agents ${sub} <runId> <task>`, "error");
 					return;
 				}
 				try {
-					await deliver(pi, cmdCtx, `Resuming ${runId}...`, (signal) =>
-						resumeSubagent({ ctx: cmdCtx, runId, task, depth: currentDepth() + 1, signal }),
-					);
+					const handle = await sendToRun({ runId, task, depth: currentDepth() + 1 });
+					startBackgroundWatcher(pi, handle.runId);
+					cmdCtx.ui.notify(`Sent to ${handle.runId}.`, "info");
+				} catch (error) {
+					cmdCtx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				}
+				return;
+			}
+			if (sub === "status") {
+				const runId = rest[0];
+				if (!runId) {
+					cmdCtx.ui.notify("Usage: /agents status <runId>", "error");
+					return;
+				}
+				try {
+					const status = await getSubagentStatus(runId);
+					const lines = [
+						`${status.status.padEnd(7)} ${status.runId}  ${status.agent}`,
+						status.text ? `Output:\n${status.text.slice(0, 1200)}` : undefined,
+					].filter(Boolean);
+					cmdCtx.ui.notify(lines.join("\n\n"), "info");
+				} catch (error) {
+					cmdCtx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				}
+				return;
+			}
+			if (sub === "cancel") {
+				const runId = rest[0];
+				if (!runId) {
+					cmdCtx.ui.notify("Usage: /agents cancel <runId>", "error");
+					return;
+				}
+				try {
+					await cancelSubagent(runId);
+					cmdCtx.ui.notify(`Cancelled ${runId}.`, "info");
 				} catch (error) {
 					cmdCtx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 				}
@@ -131,7 +118,7 @@ export function registerAgentCommands(pi: ExtensionAPI, source: ExtensionContext
 
 	for (const agent of agents) {
 		pi.registerCommand(`agent:${agent.name}`, {
-			description: `Run the ${agent.name} subagent: ${agent.description}`,
+			description: `Run the ${agent.name} subagent in the background: /agent:${agent.name} <task>`,
 			handler: async (args, cmdCtx) => {
 				let task = args.trim();
 				if (!task) {
@@ -144,9 +131,9 @@ export function registerAgentCommands(pi: ExtensionAPI, source: ExtensionContext
 					task = input.trim();
 				}
 				try {
-					await deliver(pi, cmdCtx, `Running ${agent.name}...`, (signal) =>
-						runSubagent({ ctx: cmdCtx, agent, task, depth: currentDepth() + 1, signal }),
-					);
+					const handle = await runSubagentBackground({ ctx: cmdCtx, agent, task, depth: currentDepth() + 1 });
+					startBackgroundWatcher(pi, handle.runId);
+					cmdCtx.ui.notify(formatRunIdLine(handle.runId), "info");
 				} catch (error) {
 					cmdCtx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 				}

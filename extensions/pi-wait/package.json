@@ -1,0 +1,19 @@
+{
+  "name": "@rsaran/pi-wait",
+  "version": "0.1.0",
+  "description": "Queue a delayed prompt with /wait",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension", "wait"],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": ["*.ts", "README.md"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}

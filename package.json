@@ -48,7 +48,9 @@
       "./extensions/pi-sidebar/index.ts",
       "./extensions/pi-title/index.ts",
       "./extensions/pi-notify/index.ts",
-      "./extensions/pi-pg-export/index.ts"
+      "./extensions/pi-pg-export/index.ts",
+      "./extensions/pi-mood/index.ts",
+      "./extensions/pi-wait/index.ts"
     ]
   }
 }

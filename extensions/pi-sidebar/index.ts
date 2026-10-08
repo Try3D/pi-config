@@ -91,6 +91,7 @@ export default function (pi: ExtensionAPI) {
 	const state: SidebarState = {
 		cwd: "",
 		streaming: false,
+		done: false,
 		frame: 0,
 		processes: [],
 	};
@@ -274,6 +275,7 @@ export default function (pi: ExtensionAPI) {
 			state.cwd,
 			pi.getSessionName() ?? "",
 			state.streaming ? "1" : "0",
+			state.done ? "1" : "0",
 			process.env.TMUX_PANE ?? "",
 		].join("\u0000");
 		if (signature === publishedSignature) return;
@@ -285,6 +287,7 @@ export default function (pi: ExtensionAPI) {
 				cwd: state.cwd,
 				pane: process.env.TMUX_PANE,
 				streaming: state.streaming,
+				done: state.done,
 				parentPid,
 				updatedAt: Date.now(),
 			};
@@ -328,6 +331,7 @@ export default function (pi: ExtensionAPI) {
 				cwd: str(status.cwd),
 				pane: pane && /^%\d+$/.test(pane) ? pane : undefined,
 				streaming: status.streaming === true,
+				done: status.done === true,
 				parentPid: typeof parentPid === "number" && Number.isFinite(parentPid) && parentPid > 0 ? parentPid : undefined,
 				updatedAt: typeof status.updatedAt === "number" ? status.updatedAt : 0,
 			});
@@ -489,6 +493,7 @@ export default function (pi: ExtensionAPI) {
 				tmux,
 				// Own liveness is local state; others come from their published status.
 				streaming: pid === process.pid ? state.streaming : info?.streaming === true,
+				done: pid === process.pid ? state.done : info?.done === true,
 				parentPid: info?.parentPid,
 			});
 		}
@@ -659,11 +664,19 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", () => {
 		state.streaming = true;
+		state.done = false;
+		refresh();
+	});
+
+	pi.on("input", () => {
+		if (!state.done) return;
+		state.done = false;
 		refresh();
 	});
 
 	pi.on("agent_settled", (_event, source) => {
 		state.streaming = false;
+		state.done = true;
 		syncData(source);
 		refresh();
 	});

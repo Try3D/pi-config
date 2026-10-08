@@ -1,0 +1,26 @@
+{
+  "name": "@rsaran/pi-mood",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Try3D/pi-config.git",
+    "directory": "extensions/pi-mood"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "*.ts",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

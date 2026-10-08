@@ -6,6 +6,9 @@
  * agent_settled, then keep the pane alive for a window of inactivity so the user
  * can read the result, send a follow-up, or ask a question. Any new activity
  * (a turn, a submitted prompt, a blocking dialog) resets the window.
+ *
+ * The parent watches result.json and posts a notification; follow-ups arrive as
+ * ordinary pasted input in this pane, which Pi queues as steering mid-turn.
  */
 
 import * as fs from "node:fs";
@@ -53,6 +56,23 @@ export function installChildHook(pi: ExtensionAPI): void {
 		if (settled && !turnActive && !promptActive && ctxRef) timer = setTimeout(() => ctxRef?.shutdown(), keepAliveMs);
 	};
 
+	const writeResult = (ctx: ExtensionContext, status: ChildResult["status"]): void => {
+		if (ctx.sessionManager.getSessionId() !== runId) return;
+		const result: ChildResult = {
+			status,
+			text: lastText,
+			stopReason: lastStopReason,
+			sessionId: ctx.sessionManager.getSessionId(),
+			sessionFile: ctx.sessionManager.getSessionFile(),
+			finishedAt: new Date().toISOString(),
+		};
+		try {
+			fs.writeFileSync(resultPath, JSON.stringify(result, null, 2), { mode: 0o600 });
+		} catch {
+			/* run dir may have been pruned */
+		}
+	};
+
 	// True inactivity: reset the window on any keystroke, not only on a submit.
 	// The event API has no per-keystroke hook, so listen to the TUI input stream.
 	let detachInput: (() => void) | undefined;
@@ -73,23 +93,6 @@ export function installChildHook(pi: ExtensionAPI): void {
 			/* no TUI input stream available */
 		}
 	});
-
-	const writeResult = (ctx: ExtensionContext, status: ChildResult["status"]): void => {
-		if (ctx.sessionManager.getSessionId() !== runId) return;
-		const result: ChildResult = {
-			status,
-			text: lastText,
-			stopReason: lastStopReason,
-			sessionId: ctx.sessionManager.getSessionId(),
-			sessionFile: ctx.sessionManager.getSessionFile(),
-			finishedAt: new Date().toISOString(),
-		};
-		try {
-			fs.writeFileSync(resultPath, JSON.stringify(result, null, 2), { mode: 0o600 });
-		} catch {
-			/* run dir may have been pruned */
-		}
-	};
 
 	pi.on("message_end", (event) => {
 		const message = event.message;

@@ -1,7 +1,7 @@
 ---
 name: worker
 description: General-purpose subagent with full capabilities, isolated context
-model: opencode-go/gpt-6-luna
+model: opencode-go/muse-spark-1.3-contributor
 ---
 
 You are a worker agent operating in an isolated context window. Complete the

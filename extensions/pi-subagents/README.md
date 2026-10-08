@@ -4,10 +4,13 @@ tmux-native subagents for the [Pi coding agent](https://pi.dev).
 
 Each subagent runs an interactive `pi` session in its own tmux window (tab).
 The window is added at the end and named `_1`, `_2`, `_3`, and so on. The pane
-shows the full TUI. The parent waits for the child to finish, then returns its
-final text and a git change summary. The pane stays open for 10 minutes after
-each settle. A keystroke, submitted prompt, new turn, or blocking dialog
-restarts the timer. When the timer expires, pi exits and the pane closes. Set
+shows the full TUI.
+
+By default, subagents run in the background: the parent gets a `run_id`
+immediately and a follow-up notification when the agent completes. The pane
+stays open for 10 minutes after each settle so you can read or steer it. A
+keystroke, submitted prompt, new turn, or blocking dialog restarts the timer.
+When the timer expires, pi exits and the pane closes. Set
 `PI_SUBAGENT_KEEPALIVE_MS` to change the timeout.
 
 ## Install
@@ -25,19 +28,28 @@ Requires tmux and pi running inside a tmux session.
 LLM-facing tool:
 
 ```text
+subagent({ task: "find the auth flow" })
+// defaults to the built-in general agent; returns a run_id immediately;
+// the subagent pastes its result here when it settles
+
 subagent({ agent: "scout", task: "find the auth flow" })
-// reply ends with an id, for example `agent id: scout-mu4x...`
+// use a named agent definition
+
 subagent({ agent_id: "scout-mu4x...", task: "now trace the token refresh path" })
+// send a message to an existing run (pasted into its pane)
 ```
 
 Human-facing commands:
 
 ```text
-/agent:scout find the auth flow     run an agent directly
+/agent:scout find the auth flow     run an agent in the background
 /agents                             list available agents
 /agents runs                        list recent runs with their status
 /agents open <runId>                reopen a past run's session in a pane
 /agents resume <runId> <task>       continue a past run with a new task
+/agents steer <runId> <task>        send a queued message to a running agent
+/agents status <runId>              check status or final result
+/agents cancel <runId>              stop a run
 ```
 
 ## Agent definitions
@@ -59,7 +71,8 @@ System prompt for the agent.
 - Any new `.md` becomes `/agent:<name>` after a session restart or `/reload`.
 - Omit `model` to inherit the dispatching session's model and thinking level.
 - Omit `tools` for full capabilities; otherwise the child only gets the listed tools.
-- Project agents override same-named user agents; pi-subagents reports the override at startup.
+- Omit `agent` on the `subagent` tool to use the built-in `general` agent
+  (full tools, inherited model, minimal system prompt).
 
 ## How it works
 
@@ -68,7 +81,12 @@ System prompt for the agent.
   named with the task so it is identifiable in `/resume` and the sidebar; the
   tmux pane title is `_N pi:<agent>`.
 - The child hook writes `result.json` (final text, status, session file) when
-  the agent settles; the parent returns as soon as it appears.
+  the agent settles. A parent-side watcher polls for this file and posts a
+  follow-up notification.
+- The parent sends a message to a running subagent by pasting it into the
+  child's pane; Pi queues the input as steering when the child is mid-turn. If
+  the pane is gone the run is relaunched with the same session id and the task
+  is passed as the prompt.
 - The pane stays open for 10 minutes after each settle. A keystroke, submitted
   prompt, new turn, or blocking dialog restarts the timer. When the timer
   expires, pi exits and the pane closes. Set `PI_SUBAGENT_KEEPALIVE_MS` to
@@ -84,11 +102,10 @@ System prompt for the agent.
 
 ## Lifecycle and failure
 
-- Aborting a tool run (Ctrl+C) kills the child pane.
-- Session shutdown aborts `/agent:<name>` and `/agents` command runs.
-- The parent detects a crash when the pane disappears. It returns the tail of
+- The watcher detects a crash when the pane disappears and reports the tail of
   `stderr.log` as the failure reason.
-- The parent kills a run if it does not settle within 10 minutes.
+- `/agents cancel <runId>` kills the pane and records a failed result.
+- Session shutdown stops the parent's watchers (running panes are left alive).
 
 ## Security
 

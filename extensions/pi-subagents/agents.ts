@@ -31,7 +31,7 @@ export interface AgentConfig {
 	tools?: string[];
 	model?: string;
 	systemPrompt: string;
-	source: "user" | "project";
+	source: "user" | "project" | "builtin";
 	filePath: string;
 }
 
@@ -139,4 +139,23 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentConfig[] {
 		);
 	}
 	return Array.from(map.values());
+}
+
+/** Built-in fallback used when the caller does not name an agent. */
+export const GENERIC_AGENT: AgentConfig = {
+	name: "general",
+	description: "General-purpose subagent",
+	systemPrompt: "You are a general-purpose subagent operating in an isolated context window. Complete the task autonomously.",
+	source: "builtin",
+	filePath: "",
+};
+
+/** Resolve an agent by name, or the built-in general agent when none is given. */
+export function resolveAgent(cwd: string, scope: AgentScope, name?: string): AgentConfig {
+	if (!name) return GENERIC_AGENT;
+	const agents = discoverAgents(cwd, scope);
+	const agent = agents.find((a) => a.name === name);
+	if (agent) return agent;
+	const available = agents.map((a) => `${a.name} (${a.source}): ${a.description}`).join("\n") || "none";
+	throw new Error(`Unknown agent "${name}". Available agents:\n${available}`);
 }

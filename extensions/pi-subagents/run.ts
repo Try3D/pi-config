@@ -1,43 +1,53 @@
 /**
  * Subagent lifecycle: build a run directory, launch a real interactive pi
- * session in a tmux pane, wait for the child to report completion, and collect
- * the final text plus a git change summary.
+ * session in a tmux pane, and hand messages to and from it.
  *
- * The child runs the full pi TUI. Completion is reported by the child hook (see
- * child.ts), which writes result.json and then keeps the pane alive. Module
- * split: shell.ts (quoting + pi resolution), child.ts (settle hook), tmux.ts
- * (pane allocation), changes.ts (git summary), commands.ts (commands), index.ts
- * (tool + wiring).
+ * Always background: the caller gets a run id immediately. The child hook
+ * writes result.json for status and pastes its final result into the parent
+ * pane when it settles; there is no parent-side watcher.
+ *
+ * Parent -> child steering pastes into the child's live pane; Pi queues the
+ * input as steering when the child is mid-turn. If the pane is gone the run is
+ * relaunched with the same session id and the task is passed as the prompt.
+ *
+ * Module split: shell.ts (quoting + pi resolution), child.ts (settle hook +
+ * keep-alive + parent paste), tmux.ts (pane allocation), changes.ts (git summary),
+ * commands.ts (commands), index.ts (tool + wiring).
  */
 
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getAgentDir, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "./agents.ts";
 import { gitSummary } from "./changes.ts";
 import { piInvocation, shellQuote } from "./shell.ts";
 import { acquirePane, currentSession, focusPane, killPane, paneExists, sendTask } from "./tmux.ts";
 
-const WAIT_TIMEOUT_MS = 10 * 60 * 1000;
-const POLL_MS = 400;
-/** How often to check the pane still exists (every N polls). */
-const PANE_CHECK_EVERY = 12;
 const MAX_RUN_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const RUN_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+const POLL_MS = 400;
 
 /** Nested subagents stop spawning at this depth (root session = 0). */
 export const MAX_SUBAGENT_DEPTH = 4;
 
-export interface RunResult {
+export interface RunHandle {
 	agent: string;
-	/** Conversation id: pass it back to continue this subagent's session. */
 	runId: string;
-	text: string;
-	changes: string;
-	status: "done" | "failed";
-	paneId: string | null;
+	status: "running";
+	paneId: string;
 	runDir: string;
-	timedOut: boolean;
+}
+
+export interface SubagentStatus {
+	runId: string;
+	agent: string;
+	status: "running" | "done" | "failed";
+	task: string;
+	text?: string;
+	changes?: string;
+	paneId?: string;
+	finishedAt?: string;
 }
 
 /** Launch configuration persisted per run so a finished child can be resumed. */
@@ -86,7 +96,7 @@ function runDirFor(runId: string): string {
 	return path.join(runsDir(), runId);
 }
 
-function readJson<T>(filePath: string): T | null {
+export function readJson<T>(filePath: string): T | null {
 	try {
 		// `lstat` rejects symlinks and non-regular files (e.g. a planted FIFO that
 		// would block the event loop on read).
@@ -110,7 +120,7 @@ function writeTerminalResult(runDir: string, status: "done" | "failed", text: st
 	}
 }
 
-/** Move a previous result aside so a resume wait cannot see it, without losing it. */
+/** Move a previous result aside so a new wait cannot see it, without losing it. */
 function archiveResult(runDir: string): void {
 	const resultPath = path.join(runDir, "result.json");
 	if (!fs.existsSync(resultPath)) return;
@@ -121,7 +131,7 @@ function archiveResult(runDir: string): void {
 	}
 }
 
-/** Pane id of a run's live session, persisted so a resume can continue in it. */
+/** Pane id of a run's live session, persisted so a follow-up can continue in it. */
 function readPaneId(runDir: string): string | undefined {
 	try {
 		const pane = fs.readFileSync(path.join(runDir, "pane"), "utf-8").trim();
@@ -137,10 +147,6 @@ function writePaneId(runDir: string, paneId: string): void {
 	} catch {
 		/* best-effort */
 	}
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Agent names come from frontmatter and must not move outside runs/. */
@@ -215,98 +221,12 @@ function launchCommand(meta: RunMetadata, task: string): string {
 	if (meta.thinking) args.push("--thinking", meta.thinking);
 	if (meta.tools?.length) args.push("--tools", meta.tools.join(","));
 	if (meta.promptPath) args.push("--append-system-prompt", meta.promptPath);
-	args.push(task);
+	// Empty when the pane is relaunched only to receive the pasted task as its prompt.
+	if (task) args.push(task);
 
 	const runDir = runDirFor(meta.runId);
 	const argv = [invocation.command, ...args].map(shellQuote).join(" ");
 	return `${paneEnvPrefix(runDir, meta.depth)} ${argv} 2>${shellQuote(path.join(runDir, "stderr.log"))}`;
-}
-
-/** Launch a pane and wait for the child hook to report completion. */
-async function waitForRun(options: {
-	meta: RunMetadata;
-	task: string;
-	signal?: AbortSignal;
-	onUpdate?: (text: string) => void;
-	/** Continue in the run's still-live pane instead of opening another window. */
-	reusePane?: boolean;
-}): Promise<RunResult> {
-	const { meta, task, signal, onUpdate, reusePane } = options;
-	const runDir = runDirFor(meta.runId);
-
-	// Resume into the existing pane when it is still alive; otherwise (first run,
-	// pane closed, or it died between the check and the paste) open a new one.
-	let paneId: string | undefined;
-	if (reusePane) {
-		const existing = readPaneId(runDir);
-		if (existing && (await paneExists(existing))) {
-			try {
-				const taskFile = path.join(runDir, "task.txt");
-				fs.writeFileSync(taskFile, task, { mode: 0o600 });
-				await sendTask(existing, taskFile);
-				paneId = existing;
-			} catch (error) {
-				if (await paneExists(existing)) throw error;
-				paneId = undefined;
-			}
-		}
-	}
-	if (!paneId) {
-		// Drop any planted stderr.log (e.g. a symlink) before the shell opens it with `2>`.
-		fs.rmSync(path.join(runDir, "stderr.log"), { force: true });
-		const command = launchCommand(meta, task);
-		const session = await currentSession();
-		paneId = await acquirePane({ session, cwd: meta.cwd, command, title: `pi:${meta.agent}` });
-		writePaneId(runDir, paneId);
-	}
-
-	const resultPath = path.join(runDir, "result.json");
-	const startedAt = Date.now();
-
-	try {
-		for (let poll = 0; ; poll++) {
-			if (signal?.aborted) throw new Error("Subagent aborted");
-			const result = readJson<ChildResult>(resultPath);
-			if (result) {
-				return {
-					agent: meta.agent,
-					runId: meta.runId,
-					text: typeof result.text === "string" ? result.text : readStderrTail(runDir),
-					changes: await gitSummary(meta.cwd),
-					status: result.status === "failed" ? "failed" : "done",
-					paneId,
-					runDir,
-					timedOut: false,
-				};
-			}
-			// A crashed pane never writes a result; fail in seconds, not minutes.
-			if (poll > 0 && poll % PANE_CHECK_EVERY === 0 && !(await paneExists(paneId))) {
-				const text = readStderrTail(runDir);
-				writeTerminalResult(runDir, "failed", text);
-				return {
-					agent: meta.agent,
-					runId: meta.runId,
-					text,
-					changes: await gitSummary(meta.cwd),
-					status: "failed",
-					paneId,
-					runDir,
-					timedOut: false,
-				};
-			}
-			if (Date.now() - startedAt > WAIT_TIMEOUT_MS) {
-				await killPane(paneId);
-				const text = readStderrTail(runDir);
-				writeTerminalResult(runDir, "failed", text);
-				return { agent: meta.agent, runId: meta.runId, text, changes: await gitSummary(meta.cwd), status: "failed", paneId, runDir, timedOut: true };
-			}
-			onUpdate?.(`${meta.agent} is working…`);
-			await sleep(POLL_MS);
-		}
-	} catch (error) {
-		await killPane(paneId);
-		throw error;
-	}
 }
 
 function assertTmux(): void {
@@ -315,33 +235,20 @@ function assertTmux(): void {
 	}
 }
 
-export async function runSubagent(options: {
+function buildRunMetadata(options: {
 	ctx: ExtensionContext;
 	agent: AgentConfig;
 	task: string;
-	cwd?: string;
+	cwd: string;
 	depth: number;
-	signal?: AbortSignal;
-	onUpdate?: (text: string) => void;
-}): Promise<RunResult> {
-	const { ctx, agent, task, depth, signal, onUpdate } = options;
-	const cwd = options.cwd ?? ctx.cwd;
-
-	assertTmux();
-	if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) {
-		throw new Error(`Subagent cwd does not exist or is not a directory: ${cwd}`);
-	}
-
-	const runId = `${safeRunName(agent.name)}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+	runId: string;
+}): RunMetadata {
+	const { ctx, agent, task, cwd, depth, runId } = options;
 	const runDir = runDirFor(runId);
-	fs.mkdirSync(runDir, { recursive: true, mode: 0o700 });
-	pruneRuns(runsDir());
-
 	const prompt = agent.systemPrompt.trim();
 	const promptPath = prompt ? path.join(runDir, "prompt.md") : undefined;
 	if (promptPath) fs.writeFileSync(promptPath, prompt, { encoding: "utf-8", mode: 0o600 });
-
-	const meta: RunMetadata = {
+	return {
 		runId,
 		agent: agent.name,
 		depth,
@@ -353,38 +260,74 @@ export async function runSubagent(options: {
 		task,
 		startedAt: new Date().toISOString(),
 	};
+}
+
+function prepareRunDir(runId: string): string {
+	const runDir = runDirFor(runId);
+	fs.mkdirSync(runDir, { recursive: true, mode: 0o700 });
+	pruneRuns(runsDir());
+	return runDir;
+}
+
+function runIdForAgent(agentName: string): string {
+	return `${safeRunName(agentName)}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+/** Launch a subagent in a new tmux pane and return immediately. */
+export async function runSubagentBackground(options: {
+	ctx: ExtensionContext;
+	agent: AgentConfig;
+	task: string;
+	cwd?: string;
+	depth: number;
+}): Promise<RunHandle> {
+	const { ctx, agent, task, depth } = options;
+	const cwd = options.cwd ?? ctx.cwd;
+
+	assertTmux();
+	if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) {
+		throw new Error(`Subagent cwd does not exist or is not a directory: ${cwd}`);
+	}
+
+	const runId = runIdForAgent(agent.name);
+	prepareRunDir(runId);
+	const meta = buildRunMetadata({ ctx, agent, task, cwd, depth, runId });
+	const runDir = runDirFor(runId);
 	fs.writeFileSync(path.join(runDir, "run.json"), JSON.stringify(meta, null, 2), { mode: 0o600 });
 
+	fs.rmSync(path.join(runDir, "stderr.log"), { force: true });
+	const command = launchCommand(meta, task);
 	try {
-		return await waitForRun({ meta, task, signal, onUpdate });
+		const session = await currentSession();
+		const paneId = await acquirePane({ session, cwd: meta.cwd, command, title: `pi:${meta.agent}` });
+		writePaneId(runDir, paneId);
+		return { runId, agent: agent.name, status: "running", paneId, runDir };
 	} catch (error) {
-		writeTerminalResult(runDir, "failed", error instanceof Error ? error.message : String(error));
-		throw error;
+		const message = error instanceof Error ? error.message : String(error);
+		writeTerminalResult(runDir, "failed", message);
+		throw new Error(`Failed to launch subagent pane: ${message}`, { cause: error });
 	}
 }
 
-const resumeLocks = new Map<string, Promise<unknown>>();
+const runLocks = new Map<string, Promise<unknown>>();
 
-function withResumeLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
-	const previous = resumeLocks.get(runId) ?? Promise.resolve();
+function withRunLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+	const previous = runLocks.get(runId) ?? Promise.resolve();
 	const run = previous.then(fn, fn);
-	resumeLocks.set(runId, run);
+	runLocks.set(runId, run);
 	return run.finally(() => {
-		if (resumeLocks.get(runId) === run) resumeLocks.delete(runId);
+		if (runLocks.get(runId) === run) runLocks.delete(runId);
 	});
 }
 
-export function resumeSubagent(options: {
-	ctx: ExtensionContext;
-	runId: string;
-	task: string;
-	depth: number;
-	signal?: AbortSignal;
-	onUpdate?: (text: string) => void;
-}): Promise<RunResult> {
-	return withResumeLock(options.runId, async () => {
-		const { runId, task, depth, signal, onUpdate } = options;
-		if (signal?.aborted) throw new Error("Subagent aborted");
+/**
+ * Send a message to an existing run by pasting it into the child's pane, which
+ * Pi queues as steering when the child is mid-turn. If the pane is gone the run
+ * is relaunched with the same session id and the task is passed as the prompt.
+ */
+export function sendToRun(options: { runId: string; task: string; depth: number }): Promise<RunHandle> {
+	return withRunLock(options.runId, async () => {
+		const { runId, task, depth } = options;
 		assertTmux();
 		if (!validRunId(runId)) throw new Error(`Invalid run id: ${runId}`);
 		const runDir = runDirFor(runId);
@@ -393,16 +336,186 @@ export function resumeSubagent(options: {
 		// The directory name is the authoritative id; a tampered run.json must not
 		// redirect the poll/shell paths outside runs/<runId>.
 		if (meta.runId !== runId) throw new Error(`Run metadata for "${runId}" is invalid.`);
-		if (!fs.statSync(meta.cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`Subagent cwd does not exist or is not a directory: ${meta.cwd}`);
-		// Preserve the previous result (it would otherwise satisfy the wait) rather than delete it.
-		archiveResult(runDir);
-		try {
-			return await waitForRun({ meta: { ...meta, runId, depth, task }, task, signal, onUpdate, reusePane: true });
-		} catch (error) {
-			writeTerminalResult(runDir, "failed", error instanceof Error ? error.message : String(error));
-			throw error;
+		if (!fs.statSync(meta.cwd, { throwIfNoEntry: false })?.isDirectory()) {
+			throw new Error(`Subagent cwd does not exist or is not a directory: ${meta.cwd}`);
 		}
+
+		// A new message means new work: drop the old terminal result before sending.
+		archiveResult(runDir);
+		const existing = readPaneId(runDir);
+		let paneId: string | undefined;
+		if (existing && (await paneExists(existing))) {
+			try {
+				const taskFile = path.join(runDir, "task.txt");
+				fs.writeFileSync(taskFile, task, { mode: 0o600 });
+				await sendTask(existing, taskFile);
+				paneId = existing;
+			} catch (error) {
+				if (await paneExists(existing)) throw error;
+				paneId = undefined;
+			}
+		}
+		if (!paneId) {
+			const command = launchCommand({ ...meta, runId, depth, task }, task);
+			try {
+				const session = await currentSession();
+				paneId = await acquirePane({ session, cwd: meta.cwd, command, title: `pi:${meta.agent}` });
+				writePaneId(runDir, paneId);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				writeTerminalResult(runDir, "failed", message);
+				throw new Error(`Failed to launch subagent pane: ${message}`, { cause: error });
+			}
+		}
+		return { runId, agent: meta.agent, status: "running", paneId, runDir };
 	});
+}
+
+export async function cancelSubagent(runId: string): Promise<void> {
+	assertTmux();
+	if (!validRunId(runId)) throw new Error(`Invalid run id: ${runId}`);
+	const runDir = runDirFor(runId);
+	const meta = readJson<RunMetadata>(path.join(runDir, "run.json"));
+	if (!meta) throw new Error(`No subagent run found for "${runId}".`);
+
+	const paneId = readPaneId(runDir);
+	if (paneId) await killPane(paneId);
+	const text = readStderrTail(runDir);
+	writeTerminalResult(runDir, "failed", text || "Cancelled");
+	stopBackgroundWatcher(runId);
+}
+
+export async function getSubagentStatus(runId: string): Promise<SubagentStatus> {
+	if (!validRunId(runId)) throw new Error(`Invalid run id: ${runId}`);
+	const runDir = runDirFor(runId);
+	const meta = readJson<RunMetadata>(path.join(runDir, "run.json"));
+	if (!meta) throw new Error(`No subagent run found for "${runId}".`);
+	const result = readJson<ChildResult>(path.join(runDir, "result.json"));
+	const paneId = readPaneId(runDir);
+	if (result) {
+		return {
+			runId,
+			agent: meta.agent,
+			status: result.status === "failed" ? "failed" : "done",
+			task: meta.task,
+			text: typeof result.text === "string" ? result.text : undefined,
+			changes: await gitSummary(meta.cwd).catch(() => undefined),
+			paneId,
+			finishedAt: result.finishedAt,
+		};
+	}
+	return { runId, agent: meta.agent, status: "running", task: meta.task, paneId };
+}
+
+// ---- Background run watchers ----
+
+const backgroundWatchers = new Map<string, NodeJS.Timeout>();
+
+function formatResultMessage(meta: RunMetadata, result: ChildResult, runDir: string): string {
+	const sections: string[] = [];
+	const text = typeof result.text === "string" ? result.text : readStderrTail(runDir);
+	if (text.trim()) sections.push(text.trim());
+	// Best-effort; do not block the notification on git IO.
+	const changes = gitSummarySync(meta.cwd);
+	if (changes) sections.push(`Changed files:\n${changes}`);
+	const header = result.status === "failed" ? `**${meta.agent}** failed` : `**${meta.agent}** completed`;
+	return [header, "", ...sections].join("\n") || `${header}.`;
+}
+
+function gitSummarySync(cwd: string): string {
+	// Synchronous fallback for the notification path; ignores errors and keeps
+	// git's stderr out of the terminal when cwd is not a repository.
+	try {
+		return execFileSync("git", ["-C", cwd, "status", "--short"], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+	} catch {
+		return "";
+	}
+}
+
+/** Watch a run's result.json and post a follow-up notification when it appears. */
+export function startBackgroundWatcher(pi: ExtensionAPI, runId: string): void {
+	if (backgroundWatchers.has(runId)) return;
+	const runDir = runDirFor(runId);
+	let paneMisses = 0;
+	const timer = setInterval(() => {
+		const result = readJson<ChildResult>(path.join(runDir, "result.json"));
+		if (result) {
+			stopBackgroundWatcher(runId);
+			const meta = readJson<RunMetadata>(path.join(runDir, "run.json"));
+			if (meta) {
+				pi.sendMessage(
+					{
+						customType: "pi-subagents",
+						content: formatResultMessage(meta, result, runDir),
+						display: true,
+						details: { agent: meta.agent, runId, status: result.status },
+					},
+					{ deliverAs: "followUp", triggerTurn: true },
+				);
+			}
+			return;
+		}
+		const paneId = readPaneId(runDir);
+		if (!paneId) return;
+		void paneExists(paneId).then((exists) => {
+			if (exists) {
+				paneMisses = 0;
+				return;
+			}
+			paneMisses++;
+			// Require a few consecutive misses to avoid false alarms during tmux
+			// bookkeeping; a truly dead pane stays gone across ~1.2s of polls.
+			if (paneMisses < 3) return;
+			stopBackgroundWatcher(runId);
+			const text = readStderrTail(runDir);
+			writeTerminalResult(runDir, "failed", text);
+			const meta = readJson<RunMetadata>(path.join(runDir, "run.json"));
+			if (meta) {
+				const reason = text.trim() ? `pane exited:\n${text}` : "pane exited before reporting a result";
+				pi.sendMessage(
+					{
+						customType: "pi-subagents",
+						content: `**${meta.agent}** failed: ${reason}`,
+						display: true,
+						details: { agent: meta.agent, runId, error: "pane exited" },
+					},
+					{ deliverAs: "followUp", triggerTurn: true },
+				);
+			}
+		});
+	}, POLL_MS);
+	backgroundWatchers.set(runId, timer);
+}
+
+export function stopBackgroundWatcher(runId: string): void {
+	const timer = backgroundWatchers.get(runId);
+	if (timer) {
+		clearInterval(timer);
+		backgroundWatchers.delete(runId);
+	}
+}
+
+export function stopAllBackgroundWatchers(): void {
+	for (const [runId, timer] of backgroundWatchers) {
+		clearInterval(timer);
+		backgroundWatchers.delete(runId);
+	}
+}
+
+export async function restoreBackgroundWatchers(pi: ExtensionAPI): Promise<void> {
+	for (const run of listRuns(100)) {
+		if (run.status !== "running") continue;
+		const runDir = runDirFor(run.runId);
+		const paneId = readPaneId(runDir);
+		// Only watch runs whose pane is still alive. A pane that died without
+		// writing a result is a stale crash from a previous session; mark it
+		// failed silently so it does not spam notifications on every reload.
+		if (!paneId || !(await paneExists(paneId))) {
+			writeTerminalResult(runDir, "failed", readStderrTail(runDir) || "Pane exited before reporting a result");
+			continue;
+		}
+		startBackgroundWatcher(pi, run.runId);
+	}
 }
 
 /** Recent runs, newest first. */
@@ -439,7 +552,9 @@ export async function openRunSession(runId: string, depth: number): Promise<stri
 	const meta = readJson<RunMetadata>(path.join(runDir, "run.json"));
 	if (!meta) throw new Error(`No subagent run found for "${runId}".`);
 	if (meta.runId !== runId) throw new Error(`Run metadata for "${runId}" is invalid.`);
-	if (!fs.statSync(meta.cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`Subagent cwd does not exist or is not a directory: ${meta.cwd}`);
+	if (!fs.statSync(meta.cwd, { throwIfNoEntry: false })?.isDirectory()) {
+		throw new Error(`Subagent cwd does not exist or is not a directory: ${meta.cwd}`);
+	}
 	const existing = readPaneId(runDir);
 	if (existing && (await paneExists(existing))) {
 		await focusPane(existing);

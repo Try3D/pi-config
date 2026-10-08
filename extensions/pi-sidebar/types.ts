@@ -25,6 +25,8 @@ export const SPINNER_FRAMES = ["\uee06", "\uee07", "\uee08", "\uee09", "\uee0a",
 export const INACTIVE_MARKER = "\u{f09de}";
 /** Marker for a subagent in the sidebar tree (Nerd Font icon, U+F167A). */
 export const SUBAGENT_MARKER = "\u{f167a}";
+/** Marker appended to a row whose last action finished (Nerd Font icon, U+F009E). */
+export const DONE_MARKER = "\u{f009e}";
 /** Marker for the "go up" row that jumps to the parent session (Nerd Font, U+F148). */
 export const GO_UP_MARKER = "\u{f148}";
 /** Animation interval; ~8 fps is smooth without burning CPU. */
@@ -49,6 +51,8 @@ export interface ProcessItem {
 	tmux?: TmuxTarget;
 	/** Whether the process is currently generating (drives the spinner). */
 	streaming?: boolean;
+	/** Whether the last action finished and nothing has run since (drives the done marker). */
+	done?: boolean;
 	/** Pid of the pi process that spawned this subagent, if any. */
 	parentPid?: number;
 }
@@ -60,6 +64,7 @@ export interface SharedStatus {
 	cwd?: string;
 	pane?: string;
 	streaming?: boolean;
+	done?: boolean;
 	parentPid?: number;
 	updatedAt: number;
 }
@@ -67,6 +72,8 @@ export interface SharedStatus {
 export interface SidebarState {
 	cwd: string;
 	streaming: boolean;
+	/** Whether this process's last action finished (published so every pane sees it). */
+	done: boolean;
 	/** Spinner frame index, advanced while anything is streaming. */
 	frame: number;
 	processes: ProcessItem[];

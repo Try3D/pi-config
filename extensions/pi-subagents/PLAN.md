@@ -33,8 +33,8 @@ Everything else (usage, session management) is secondary.
   - tmux `-c <cwd>` sets the working directory.
   - tmux panes see the tmux server env, not the caller's. The command passes
     every needed variable explicitly.
-- The `subagent` tool waits until the child reports completion. It does not need
-  to stream token deltas back to the parent.
+- The `subagent` tool returns immediately with a run id (always background). It
+  does not need to stream token deltas back to the parent.
 
 ## Completion contract
 
@@ -42,7 +42,8 @@ The extension installs the child hook (`child.ts`) only when
 `PI_SUBAGENT_RUN_DIR` is set:
 
 - `message_end` (assistant) tracks the latest text and `stopReason`.
-- `agent_settled` writes `result.json` and arms the idle timer.
+- `agent_settled` writes `result.json` and arms the idle timer. The parent's
+  watcher picks up the result and posts a notification.
 - `session_shutdown` writes a `failed` result if the run never settled.
 
 ```
@@ -92,7 +93,7 @@ need an exit sentinel.
 ```
 pi-subagents/
   index.ts      # extension entry: child hook + `subagent` tool + command wiring
-  child.ts      # child-side settle hook, keep-alive, shutdown
+  child.ts      # child-side settle hook, keep-alive
   run.ts        # run dir/run.json, launch command, wait, resume, list, open
   shell.ts      # shell quoting + pi invocation resolution
   tmux.ts       # current-session window/pane management (open, kill)
@@ -128,5 +129,10 @@ pi-subagents/
 - Phase 2 (v2) is done. It adds full-TUI execution without `run.sh` or `jsonl`,
   the settle hook, a 10-minute keep-alive, resume commands (`resume`, `open`,
   `runs`), and depth-4 nesting.
-- Parallel and chain modes are still planned. Background and detached runs,
-  along with per-agent settings, are also planned.
+- Background execution is always on: the single `subagent` tool returns a run id
+  and takes `agent_id` to continue a run. Parent -> child messages are pasted
+  into the child's pane; child -> parent results are written to `result.json`
+  and delivered by the parent's watcher. The `/agents` commands cover
+  runs/open/resume/steer/status/cancel.
+- Parallel and chain modes are still planned. Per-agent settings are also
+  planned.

@@ -11,7 +11,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { sanitize, workspaceSortKey, workspaceTitle } from "./format.ts";
-import { GO_UP_MARKER, INACTIVE_MARKER, SPINNER_FRAMES, SUBAGENT_MARKER, type ProcessItem, type SidebarState, type Side } from "./types.ts";
+import { DONE_MARKER, GO_UP_MARKER, INACTIVE_MARKER, SPINNER_FRAMES, SUBAGENT_MARKER, type ProcessItem, type SidebarState, type Side } from "./types.ts";
 
 export class SidebarComponent implements Component {
 	private rowPids = new Map<number, number>();
@@ -142,13 +142,16 @@ export class SidebarComponent implements Component {
 			const glyphText = theme.fg(tone, glyph);
 			const tabText = tab ? theme.fg("dim", tab) : "";
 			const elapsedText = theme.fg("dim", item.elapsed);
+			// Appended once the process's last action finished; cleared when it runs again
+			// and never shown on the current row, since you are already looking at it.
+			const doneText = item.done && !item.current ? theme.fg("success", DONE_MARKER) : "";
 			// Reserve everything but the label so the elapsed time is never clipped.
-			const overhead = visibleWidth(head) + visibleWidth(glyphText) + 1 + visibleWidth(tabText) + 1 + visibleWidth(elapsedText);
+			const overhead = visibleWidth(head) + visibleWidth(glyphText) + 1 + visibleWidth(tabText) + 1 + visibleWidth(elapsedText) + (doneText ? visibleWidth(doneText) + 1 : 0);
 			const available = Math.max(1, Math.min(this.labelWidth(), inner - 1 - overhead));
 			const limited = truncateToWidth(item.label, available, "…");
 			const name = item.current ? theme.fg("accent", limited) : theme.fg("text", limited);
 			this.rowPids.set(body.length, item.pid);
-			body.push(row(head + glyphText + " " + tabText + name + " " + elapsedText));
+			body.push(row(head + glyphText + " " + tabText + name + " " + elapsedText + (doneText ? " " + doneText : "")));
 
 			const kids = children.get(item.pid) ?? [];
 			const childPrefix = prefix + (depth === 0 ? "" : isLast ? "   " : "│  ");

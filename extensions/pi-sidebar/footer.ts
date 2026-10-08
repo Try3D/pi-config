@@ -42,8 +42,8 @@ function contextBar(theme: Theme, readout: string): string {
 }
 
 export class QuietFooter extends FooterComponent {
-	constructor(footerData: ReadonlyFooterDataProvider, stub: unknown, private readonly theme: Theme) {
-		super(stub as never, footerData);
+	constructor(private readonly moodFooterData: ReadonlyFooterDataProvider, stub: unknown, private readonly theme: Theme) {
+		super(stub as never, moodFooterData);
 	}
 
 	/** Ignore pi swapping in the real session, which would re-add the name. */
@@ -51,6 +51,24 @@ export class QuietFooter extends FooterComponent {
 
 	override render(width: number): string[] {
 		const lines = super.render(width);
+		const statuses = this.moodFooterData.getExtensionStatuses();
+		const mood = statuses.get("pi-mood");
+		if (mood !== undefined) {
+			const pwd = lines[0];
+			if (pwd !== undefined) {
+				const available = Math.max(0, width - visibleWidth(mood) - 1);
+				const left = truncateToWidth(pwd, available, "");
+				const gap = Math.max(1, width - visibleWidth(left) - visibleWidth(mood));
+				lines[0] = truncateToWidth(left + " ".repeat(gap) + mood, width, "");
+			}
+			const otherStatuses = Array.from(statuses.entries())
+				.filter(([key]) => key !== "pi-mood")
+				.sort(([a], [b]) => a.localeCompare(b))
+				.map(([, text]) => text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim())
+				.join(" ");
+			if (otherStatuses && lines.length > 2) lines[2] = truncateToWidth(otherStatuses, width, this.theme.fg("dim", "..."));
+			else if (lines.length > 2) lines.splice(2, 1);
+		}
 		const index = lines.findIndex((line) => CONTEXT_RE.test(line.replace(ANSI_RE, "")));
 		const line = lines[index];
 		if (index === -1 || !line) return lines;
