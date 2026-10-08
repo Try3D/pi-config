@@ -142,7 +142,7 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentConfig[] {
 }
 
 /** Built-in fallback used when the caller does not name an agent. */
-export const GENERIC_AGENT: AgentConfig = {
+const GENERIC_AGENT: AgentConfig = {
 	name: "general",
 	description: "General-purpose subagent",
 	systemPrompt: "You are a general-purpose subagent operating in an isolated context window. Complete the task autonomously.",
@@ -156,6 +156,8 @@ export function resolveAgent(cwd: string, scope: AgentScope, name?: string): Age
 	const agents = discoverAgents(cwd, scope);
 	const agent = agents.find((a) => a.name === name);
 	if (agent) return agent;
+	// The built-in default is selectable by name, but a real agent of that name wins.
+	if (name === GENERIC_AGENT.name) return GENERIC_AGENT;
 	const available = agents.map((a) => `${a.name} (${a.source}): ${a.description}`).join("\n") || "none";
 	throw new Error(`Unknown agent "${name}". Available agents:\n${available}`);
 }

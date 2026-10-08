@@ -9,6 +9,8 @@ Extensions for the [Pi coding agent](https://pi.dev).
 | [pi-title](extensions/pi-title/README.md) | Generates session titles from the first exchange (`/title`) |
 | [pi-notify](extensions/pi-notify/README.md) | macOS notifications when a session finishes or needs attention |
 | [pi-pg-export](extensions/pi-pg-export/README.md) | Exports interactive pi sessions to Postgres for auditability |
+| [pi-mood](extensions/pi-mood/README.md) | Experimental footer mascot picked by a System One classifier (future-deprecated) |
+| [pi-wait](extensions/pi-wait/README.md) | Queues a prompt after a delay with `/wait` |
 
 ## Install
 
@@ -26,12 +28,12 @@ pi -e ./extensions/pi-subagents/index.ts
 
 ## Development
 
-The root `package.json` uses `"*"` for pi core `devDependencies`, which only
-resolve when pi itself is present, for example when you install this repo inside
-a pi installation. On a fresh machine, `npm install` will not resolve them from
-the registry.
+The root `package.json` uses `"*"` for pi core `devDependencies`. The lockfile
+resolves `@earendil-works/*` to registry tarballs, so `npm ci` installs them on
+a fresh machine; the real hazard is version skew between that pinned copy and
+the pi installation the extension actually runs in.
 
 ```sh
-npm install
-npm run check
+npm ci
+npm run audit:code
 ```

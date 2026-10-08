@@ -25,6 +25,7 @@ interface ChildResult {
 	sessionId: string;
 	sessionFile?: string;
 	finishedAt: string;
+	turnStartedAt?: number;
 }
 
 export function installChildHook(pi: ExtensionAPI): void {
@@ -40,6 +41,7 @@ export function installChildHook(pi: ExtensionAPI): void {
 	const resultPath = path.join(runDir, "result.json");
 	let lastText = "";
 	let lastStopReason: string | undefined;
+	let turnStartedAt: number | undefined;
 	let settled = false;
 	let turnActive = false;
 	let promptActive = false;
@@ -65,6 +67,7 @@ export function installChildHook(pi: ExtensionAPI): void {
 			sessionId: ctx.sessionManager.getSessionId(),
 			sessionFile: ctx.sessionManager.getSessionFile(),
 			finishedAt: new Date().toISOString(),
+			turnStartedAt,
 		};
 		try {
 			fs.writeFileSync(resultPath, JSON.stringify(result, null, 2), { mode: 0o600 });
@@ -117,6 +120,7 @@ export function installChildHook(pi: ExtensionAPI): void {
 		turnActive = true;
 		lastText = "";
 		lastStopReason = undefined;
+		turnStartedAt = Date.now();
 		disarm();
 	});
 	pi.on("ui_prompt_start", () => {

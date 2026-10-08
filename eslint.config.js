@@ -2,7 +2,7 @@ import js from "@eslint/js";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-	{ ignores: ["node_modules/**", "scripts/**/*.mjs"] },
+	{ ignores: ["node_modules/**"] },
 	js.configs.recommended,
 	...tseslint.configs.recommendedTypeChecked,
 	{
@@ -16,5 +16,12 @@ export default tseslint.config(
 			"@typescript-eslint/no-non-null-assertion": "error",
 			"@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }],
 		},
+	},
+	{
+		files: ["**/*.mjs"],
+		languageOptions: {
+			globals: { console: "readonly", fetch: "readonly", process: "readonly", setTimeout: "readonly", URL: "readonly" },
+		},
+		rules: tseslint.configs.disableTypeChecked.rules,
 	},
 );

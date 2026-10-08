@@ -82,7 +82,6 @@ export default function (pi: ExtensionAPI) {
 			title = cleanTitle(textOf(response.content), config.maxLength);
 		}
 		if (!title) throw new Error(`no usable title text: ${describeResponse(model, response, maxTokens)}`);
-		pi.setSessionName(title);
 		return title;
 	}
 
@@ -104,7 +103,12 @@ export default function (pi: ExtensionAPI) {
 		generating = true;
 		try {
 			const title = await generate(ctx, false);
-			if (title) notify(ctx, `Session titled: ${title}`);
+			// The session may have switched while the model ran; only title the session we scheduled.
+			if (sessionKey(ctx) !== key) return;
+			if (title && ctx.isIdle()) {
+				pi.setSessionName(title);
+				notify(ctx, `Session titled: ${title}`);
+			}
 		} catch (error) {
 			logTitleError(`auto: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
@@ -152,7 +156,11 @@ export default function (pi: ExtensionAPI) {
 
 			if (!input) {
 				try {
-					notify(ctx, `Title: ${await generate(ctx, true)}`);
+					const title = await generate(ctx, true);
+					if (title) {
+						pi.setSessionName(title);
+						notify(ctx, `Title: ${title}`);
+					}
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					logTitleError(`manual: ${message}`);

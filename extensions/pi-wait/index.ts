@@ -26,11 +26,6 @@ type WaitState = { version: 1; pending: PendingWait | null };
 
 type WidgetTheme = Pick<Theme, "fg" | "bold">;
 
-const PLAIN_THEME: WidgetTheme = {
-	fg: (_color, text) => text,
-	bold: (text) => text,
-};
-
 function parseDuration(input: string): number {
 	const trimmed = input.trim();
 	const match = /^(\d+(?:\.\d+)?|\.\d+)(ms|s|m|h)?$/.exec(trimmed);
@@ -57,7 +52,7 @@ function formatRemaining(ms: number): string {
 	return remMinutes ? `${hours}h ${remMinutes}m` : `${hours}h`;
 }
 
-function formatWidget(wait: PendingWait, width: number, now: number, theme: WidgetTheme = PLAIN_THEME): string {
+function formatWidget(wait: PendingWait, width: number, now: number, theme: WidgetTheme): string {
 	const prompt = wait.prompt.replace(/\s+/g, " ").trim();
 	const [icon, state, hints] =
 		"paused" in wait
@@ -73,14 +68,26 @@ function formatWidget(wait: PendingWait, width: number, now: number, theme: Widg
 	);
 }
 
+function isPendingWait(value: unknown): value is PendingWait {
+	if (!value || typeof value !== "object") return false;
+	const wait = value as Record<string, unknown>;
+	if (typeof wait.prompt !== "string") return false;
+	if (wait.paused === true) return Number.isFinite(wait.remaining);
+	if ("dueAt" in wait) return Number.isFinite(wait.dueAt);
+	if ("delay" in wait) return Number.isFinite(wait.delay);
+	return false;
+}
+
 function readWaitState(entries: readonly SessionEntry[]): WaitState | undefined {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		if (entry?.type !== "custom" || entry.customType !== WAIT_STATE_ENTRY) continue;
 		const data = entry.data;
-		if (data && typeof data === "object" && "version" in data && (data as WaitState).version === 1) {
-			return data as WaitState;
-		}
+		if (!data || typeof data !== "object" || !("version" in data) || data.version !== 1) continue;
+		const statePending = "pending" in data ? data.pending : undefined;
+		if (statePending === null) return { version: 1, pending: null };
+		if (isPendingWait(statePending)) return { version: 1, pending: statePending };
+		return undefined;
 	}
 	return undefined;
 }
@@ -174,6 +181,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function arm(ctx: ExtensionContext, wait: PendingWait, delay: number): void {
+		clearTimers();
 		const armed: PendingWait = { prompt: wait.prompt, dueAt: Date.now() + delay };
 		pending = armed;
 		persist(armed);
@@ -190,6 +198,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		if (!("dueAt" in wait)) {
+			if (ctx.isIdle()) return arm(ctx, wait, wait.delay);
 			pending = wait;
 			renderWidget(ctx);
 			return;
@@ -316,6 +325,8 @@ export default function (pi: ExtensionAPI) {
 		if (event.reason === "reload") {
 			const state = readWaitState(ctx.sessionManager.getBranch());
 			if (state?.pending) restore(ctx, state.pending);
+		} else {
+			persist(undefined);
 		}
 	});
 

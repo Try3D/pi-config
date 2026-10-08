@@ -55,8 +55,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { Component, OverlayHandle, OverlayOptions, StackEntry, TUI } from "@earendil-works/pi-tui";
 import { HStack, isViewportTUI } from "@earendil-works/pi-tui";
-import { watch, type FSWatcher } from "node:fs";
-import { mkdir, readFile, readdir, readlink, unlink, writeFile } from "node:fs/promises";
+import { constants, watch, type FSWatcher } from "node:fs";
+import { lstat, mkdir, readFile, readdir, readlink, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import {
 	elapsedMs,
@@ -242,6 +242,7 @@ export default function (pi: ExtensionAPI) {
 
 	/** Run the spinner only while something is streaming and the panel is visible. */
 	const ensureAnimation = () => {
+		if (shuttingDown) return;
 		const busy = visible && (state.streaming || state.processes.some((item) => item.streaming));
 		if (busy && !animTimer) {
 			animTimer = setInterval(() => {
@@ -267,6 +268,8 @@ export default function (pi: ExtensionAPI) {
 	let publishedSignature: string | undefined;
 	let watcher: FSWatcher | undefined;
 	let watchDebounce: ReturnType<typeof setTimeout> | undefined;
+	let watchRetry: ReturnType<typeof setTimeout> | undefined;
+	let watchBackoff = 1_000;
 
 	/** Publish this process's own status; other sidebars watch the directory and merge it in. */
 	const publishSelf = async (): Promise<void> => {
@@ -291,7 +294,15 @@ export default function (pi: ExtensionAPI) {
 				parentPid,
 				updatedAt: Date.now(),
 			};
-			await writeFile(ownFile, `${JSON.stringify(status)}\n`, { mode: 0o600 });
+			// Write to a temp file opened O_NOFOLLOW, then rename into place, so a planted
+			// symlink is neither followed nor left in place; the rename is atomic.
+			const tmpFile = `${ownFile}.tmp`;
+			if ((await lstat(ownFile).catch(() => undefined))?.isSymbolicLink()) await unlink(ownFile);
+			await writeFile(tmpFile, `${JSON.stringify(status)}\n`, {
+				mode: 0o600,
+				flag: constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+			});
+			await rename(tmpFile, ownFile);
 			publishedSignature = signature;
 		} catch {
 			/* best-effort */
@@ -349,10 +360,18 @@ export default function (pi: ExtensionAPI) {
 				if (watchDebounce) clearTimeout(watchDebounce);
 				watchDebounce = setTimeout(() => void loadProcesses(), 150);
 			});
-			// A deleted/replaced directory emits 'error'; unhandled it would throw.
+			watchBackoff = 1_000;
+			// A deleted/replaced directory emits 'error'; re-arm with backoff instead of
+			// dropping to the slow poll forever. The 5s poll still runs meanwhile.
 			watcher.on("error", () => {
 				watcher?.close();
 				watcher = undefined;
+				if (shuttingDown || watchRetry) return;
+				watchRetry = setTimeout(() => {
+					watchRetry = undefined;
+					if (!shuttingDown) void startWatching();
+				}, watchBackoff);
+				watchBackoff = Math.min(watchBackoff * 2, 30_000);
 			});
 		} catch {
 			/* watching is optional */
@@ -419,32 +438,36 @@ export default function (pi: ExtensionAPI) {
 	const listProcesses = async (): Promise<ProcessItem[]> => {
 		let output: string;
 		try {
-			// `args` is last and may contain spaces, so parse the four fixed columns
-			// with a regex instead of splitting on whitespace.
-			output = (await pi.exec("ps", ["-eo", "pid=,ppid=,comm=,etime=,args="])).stdout;
+			// `args` is last and may contain spaces, so parse the fixed columns with a
+			// regex instead of splitting on whitespace.
+			const result = await pi.exec("ps", ["-eo", "pid=,ppid=,etime=,args="], { timeout: 2000 });
+			if (result.killed) return [];
+			output = result.stdout;
 		} catch {
 			return [];
 		}
 		const parsed = output
 			.split("\n")
-			.map((line) => /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$/.exec(line))
+			.map((line) => /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line))
 			.filter((match): match is RegExpExecArray => match !== null)
 			.map((match) => ({
 				pid: Number(match[1] ?? NaN),
 				ppid: Number(match[2] ?? NaN),
-				comm: match[3] ?? "",
-				etime: match[4] ?? "",
-				args: match[5] ?? "",
+				etime: match[3] ?? "",
+				args: match[4] ?? "",
 			}));
 		const parents = new Map<number, number>();
 		for (const row of parsed) if (Number.isFinite(row.pid) && Number.isFinite(row.ppid)) parents.set(row.pid, row.ppid);
 
-		// `comm` is the basename on Linux but a (truncated) path on macOS, and a
-		// node/bun install reports `node`/`bun`; accept both shapes.
+		// Match the executable (the first args token) rather than the whole command
+		// line, so `grep pi` or an editor opening a pi file is not a pi process. The
+		// comm column is not used: macOS reports it as a whitespace-containing path.
 		const rows = parsed.filter((row) => {
-			const comm = basename(row.comm).replace(/\.exe$/, "");
-			if (comm === "pi" || comm === "pi-coding-agent") return true;
-			return /^(node|bun)$/.test(comm) && /(^|[\s/])pi(-coding-agent)?([\s/]|$)/.test(row.args);
+			const args = row.args.trim();
+			const command = args.split(/\s+/, 1)[0] ?? "";
+			const exe = basename(command).replace(/\.exe$/, "");
+			if (exe === "pi" || exe === "pi-coding-agent") return true;
+			return /^(node|bun)$/.test(exe) && /(^|[\s/])pi(-coding-agent)?([\s/]|$)/.test(args.slice(command.length));
 		});
 
 		// One lsof call for all found pids gives each process's cwd.
@@ -452,7 +475,8 @@ export default function (pi: ExtensionAPI) {
 		const cwds = new Map<number, string>();
 		if (pids.length > 0) {
 			try {
-				const lsof = await pi.exec("lsof", ["-a", "-p", pids.join(","), "-Fn"]);
+				const lsof = await pi.exec("lsof", ["-a", "-p", pids.join(","), "-Fn"], { timeout: 3000 });
+				if (lsof.killed) throw new Error("lsof timed out");
 				let pid: number | undefined;
 				let fd = "";
 				for (const line of lsof.stdout.split("\n")) {
@@ -614,6 +638,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", () => {
 		shuttingDown = true;
+		state.streaming = false;
+		state.done = false;
 		removeResizeListener();
 		if (timer) {
 			clearInterval(timer);
@@ -630,6 +656,10 @@ export default function (pi: ExtensionAPI) {
 		if (watchDebounce) {
 			clearTimeout(watchDebounce);
 			watchDebounce = undefined;
+		}
+		if (watchRetry) {
+			clearTimeout(watchRetry);
+			watchRetry = undefined;
 		}
 		void unlink(ownFile).catch(() => undefined);
 		try {

@@ -3,9 +3,10 @@
  * - agent_settled: "finished" when pi will not continue automatically
  * - ui_prompt_start: "needs attention" when a blocking prompt appears
  *
- * Subagent panes (PI_SUBAGENT_RUN_DIR set) do not send the "finished"
- * notification. Their parent reports each result, so a notification for every
- * run would be redundant. Prompts still notify because they block.
+ * Subagent panes do not send the "finished" notification: when
+ * PI_SUBAGENT_RUN_DIR is set and the session id matches the run dir, the parent
+ * reports each result, so a notification per run would be redundant. Prompts
+ * still notify because they block.
  *
  * Prompts that close within PROMPT_NOTIFY_DELAY_MS do not notify. Extensions
  * sometimes open a no-op custom overlay to get a TUI handle (the sidebar does
@@ -57,13 +58,15 @@ export default function (pi: ExtensionAPI) {
 
 	const isInteractive = (ctx: { mode: string }) => ctx.mode === "tui" || ctx.mode === "rpc";
 	const preview = (text: string | undefined) =>
-		text ? (text.length > 140 ? `${text.slice(0, 139)}…` : text) : "Finished";
+		text ? (Array.from(text).length > 140 ? `${Array.from(text).slice(0, 139).join("")}…` : text) : "Finished";
 
 	pi.on("agent_settled", (_event, ctx) => {
 		// Do not notify when a subagent pane finishes. Its parent reports the result.
-		if (process.env.PI_SUBAGENT_RUN_DIR) return;
+		const runDir = process.env.PI_SUBAGENT_RUN_DIR;
+		if (runDir && ctx.sessionManager.getSessionId() === basename(runDir)) return;
 		if (!isInteractive(ctx) || stopReason === "aborted") return;
-		notify(`π ${basename(ctx.cwd)}`, preview(lastText));
+		const body = stopReason === "error" ? "Failed" : stopReason === "length" ? "Truncated" : preview(lastText);
+		notify(`π ${basename(ctx.cwd)}`, body);
 	});
 
 	// A real blocking prompt stays open until the user acts; a throwaway overlay

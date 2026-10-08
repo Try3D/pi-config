@@ -73,16 +73,15 @@ export function describeResponse(model: TitleModel, response: TitleResponse, max
 export function cleanTitle(raw: string, maxLength: number): string | undefined {
 	const firstLine = raw.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
 	if (!firstLine) return undefined;
-	const title = firstLine
+	const cleaned = firstLine
 		.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, "")
 		.replace(/^\s*title\s*:\s*/i, "")
 		.replace(/^#+\s*/, "")
 		.replace(/^[“”"'`]+|[“”"'`]+$/g, "")
 		.replace(/\s+/g, " ")
 		.replace(/[.!?]+$/, "")
-		.trim()
-		.slice(0, maxLength)
 		.trim();
+	const title = Array.from(cleaned).slice(0, maxLength).join("").trim();
 	return title.length >= 2 ? title : undefined;
 }
 

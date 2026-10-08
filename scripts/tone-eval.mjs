@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { faceCriteria, INSTRUCTIONS, pickFace, resetMoodHistory } from "/Users/rsaran/workspace/Projects/pi-config/extensions/pi-mood/mood.ts";
+import { faceCriteria, INSTRUCTIONS, resetMoodHistory } from "../extensions/pi-mood/mood.ts";
 const key = JSON.parse(readFileSync(`${process.env.HOME}/.pi/agent/auth.json`, "utf8"))["opencode-go"].key;
 const emoteOf = (k) => k.replace(/\d+$/, "");
 const tones = [

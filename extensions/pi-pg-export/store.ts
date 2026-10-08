@@ -2,10 +2,19 @@ import pg from "pg";
 
 const { Client } = pg;
 
-const DEFAULT_CONNECTION = "postgres://pi_tracker:pi_tracker@localhost:5433/pi_tracker";
+let warnedMissingConnection = false;
 
-export function trackerConnectionString(): string {
-	return process.env.PI_TRACKER_DATABASE_URL ?? process.env.DATABASE_URL ?? DEFAULT_CONNECTION;
+/** Export is opt-in: without an explicit URL the tracker stays disabled. */
+export function trackerConnectionString(): string | null {
+	const url = process.env.PI_TRACKER_DATABASE_URL;
+	if (!url) {
+		if (!warnedMissingConnection) {
+			warnedMissingConnection = true;
+			console.error("[pi-pg-export] PI_TRACKER_DATABASE_URL is not set; export disabled");
+		}
+		return null;
+	}
+	return url;
 }
 
 /** Postgres text/jsonb reject NUL (0x00); drop it from a string. */
@@ -13,12 +22,16 @@ function stripNulText(text: string): string {
 	return text.replaceAll("\u0000", "");
 }
 
-/** Deep-copy `value` with NUL removed from every string, so the JSON stays valid. */
-function stripNul(value: unknown): unknown {
+/** Deep-copy `value` with NUL removed from every string and key, so the JSON stays valid. */
+function stripNul(value: unknown, depth = 0): unknown {
 	if (typeof value === "string") return stripNulText(value);
-	if (Array.isArray(value)) return value.map(stripNul);
+	if (depth >= 100) return "[MaxDepth]";
+	if (Array.isArray(value)) return value.map((item) => stripNul(item, depth + 1));
 	if (typeof value === "object" && value !== null) {
-		return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, stripNul(item)]));
+		if (value instanceof Date || value instanceof Error) return value;
+		const out: Record<string, unknown> = {};
+		for (const [key, item] of Object.entries(value)) out[stripNulText(key)] = stripNul(item, depth + 1);
+		return out;
 	}
 	return value;
 }
@@ -108,6 +121,17 @@ export interface EventInsert {
 	occurredAt: Date;
 }
 
+/** Postgres/Node error text, keeping the raw error object out of logs. */
+export function pgErrorText(error: unknown): string {
+	if (typeof error !== "object" || error === null) return String(error);
+	const code = (error as { code?: unknown }).code;
+	const message = (error as { message?: unknown }).message;
+	const parts: string[] = [];
+	if (typeof code === "string") parts.push(code);
+	if (typeof message === "string") parts.push(message);
+	return parts.length > 0 ? parts.join(": ") : "unknown error";
+}
+
 /**
  * Serialized writes onto one pg Client. A Client rejects concurrent queries, and
  * an audit timeline needs ordering, so every write is queued.
@@ -115,19 +139,43 @@ export interface EventInsert {
 export class PgStore {
 	private queue: Promise<void> = Promise.resolve();
 	private readonly client: InstanceType<typeof Client>;
+	private unusable = false;
+	private closed = false;
 
 	private constructor(client: InstanceType<typeof Client>) {
 		this.client = client;
 	}
 
 	static async connect(connectionString: string): Promise<PgStore> {
+		// Refuse to ship an audit trail in plaintext to a remote host.
+		try {
+			const url = new URL(connectionString);
+			const host = url.hostname;
+			const local = host === "localhost" || host === "127.0.0.1" || host === "::1";
+			if (!local && url.searchParams.get("sslmode") !== "require") {
+				throw new Error(`refusing non-local host "${host}" without sslmode=require`);
+			}
+		} catch (error) {
+			// Re-throw the TLS guard; ignore URL parse failures (e.g. keyword/value form).
+			if (!(error instanceof TypeError)) throw error;
+		}
 		// Cap connect and query waits so an unresponsive database cannot hang pi shutdown.
 		const client = new Client({ connectionString, connectionTimeoutMillis: 5_000, query_timeout: 10_000 });
+		const store = new PgStore(client);
+		// An idle-client failure arrives as an 'error' event; without a listener Node
+		// throws it and kills pi, so log once and mark the client unusable instead.
+		client.on("error", (error) => {
+			if (store.unusable || store.closed) return;
+			store.unusable = true;
+			console.error("[pi-pg-export] database connection error:", pgErrorText(error));
+		});
 		await client.connect();
-		return new PgStore(client);
+		return store;
 	}
 
 	private run<T>(work: () => Promise<T>): Promise<T> {
+		if (this.closed) return Promise.reject(new Error("PgStore is closed"));
+		if (this.unusable) return Promise.reject(new Error("PgStore is unusable"));
 		const next = this.queue.then(work, work);
 		this.queue = next.then(
 			() => undefined,
@@ -305,7 +353,8 @@ export class PgStore {
 
 	/** Drain the queue, then close the connection. */
 	async close(): Promise<void> {
+		this.closed = true;
 		await this.queue;
-		await this.client.end();
+		await this.client.end().catch(() => undefined);
 	}
 }

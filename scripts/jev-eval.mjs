@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
-import { faceCriteria, INSTRUCTIONS, pickFace, resetMoodHistory } from "../extensions/pi-mood/mood.ts";
+import { faceCriteria, INSTRUCTIONS, resetMoodHistory } from "../extensions/pi-mood/mood.ts";
 
 const key = JSON.parse(readFileSync(`${process.env.HOME}/.pi/agent/auth.json`, "utf8"))["opencode-go"].key;
-const palette = JSON.parse(readFileSync("emoticons.json", "utf8"));
+const palette = JSON.parse(readFileSync(new URL("../emoticons.json", import.meta.url), "utf8"));
 const faceByKey = {};
 {
 	const c = new Map();

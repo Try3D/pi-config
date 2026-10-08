@@ -3,8 +3,8 @@
  *
  * - `subagent` tool: delegate a task to a named agent, or send a message to an
  *   existing run by passing `agent_id`. Always runs in the background; the tool
- *   returns a run id immediately and the child pastes its result into this pane
- *   when it settles.
+ *   returns a run id immediately and a parent-side watcher posts the child's
+ *   result as a follow-up notification when it settles.
  * - `/agent:<name> <task>` commands: the human can directly run a named agent.
  *
  * Each subagent runs a real interactive pi session in its own tmux window of
@@ -54,6 +54,9 @@ export default function (pi: ExtensionAPI) {
 				const depth = currentDepth() + 1;
 
 				if (params.agent_id) {
+					if (params.agent || params.cwd) {
+						throw new Error("agent_id already identifies the run; do not pass agent or cwd with it.");
+					}
 					const handle = await sendToRun({ runId: params.agent_id, task: params.task, depth });
 					startBackgroundWatcher(pi, handle.runId);
 					return {
@@ -83,10 +86,10 @@ export default function (pi: ExtensionAPI) {
 		if (commandsRegistered) return;
 		commandsRegistered = true;
 		registerAgentCommands(pi, ctx);
-		// Reloaded sessions may have background runs that started before the reload;
-		// restart watchers so their completion notifications still land. Stale runs
-		// whose pane already died are marked failed silently instead of notifying.
-		if (event.reason === "reload") void restoreBackgroundWatchers(pi);
+		// Only the parent session restores watchers. Child sessions also load this
+		// extension; restoring there would make a child watch every run and post
+		// notifications into its own context (or mark its own run failed).
+		if (!process.env.PI_SUBAGENT_RUN_DIR) void restoreBackgroundWatchers(pi);
 	});
 
 	pi.on("session_shutdown", () => {

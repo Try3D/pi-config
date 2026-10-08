@@ -5,7 +5,8 @@
  * commands enforce.
  */
 
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { closeSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
 	DEFAULT_LABEL_WIDTH,
@@ -24,6 +25,13 @@ export interface Config {
 
 const agentDir = dirname(SHARED_DIR);
 export const settingsPath = join(agentDir, "settings.json");
+// Deliberately NOT `settings.json.lock`: pi core locks that exact path as a
+// directory via proper-lockfile, so a regular file there would break its writes.
+const lockPath = `${settingsPath}.pi-config.lock`;
+const LOCK_RETRIES = 50;
+const LOCK_RETRY_MS = 20;
+/** A lock older than this was left by a hard kill: the critical section is a fast read+write. */
+const LOCK_STALE_MS = 10_000;
 
 /** Coerce a value to a usable column count. */
 export const clampWidth = (value: number): number => Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, Math.round(value)));
@@ -52,14 +60,67 @@ export function readConfig(): Config {
 	return normalize(settings.custom?.sidebar ?? {});
 }
 
+/** Sleep synchronously so the lock retry loop can back off without making writeConfig async. */
+const sleepSync = (ms: number): void => {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+};
+
+/**
+ * Read-modify-write the settings file under an exclusive lock so concurrent
+ * writers cannot clobber each other, writing to a unique temp file and renaming
+ * it into place. The lock is released even when the write fails.
+ */
+function updateSettings(mutate: (settings: Record<string, unknown>) => Record<string, unknown>): void {
+	let lock: number | undefined;
+	try {
+		for (let attempt = 0; ; attempt++) {
+			try {
+				lock = openSync(lockPath, "wx");
+				break;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException)?.code !== "EEXIST" || attempt >= LOCK_RETRIES) throw error;
+				try {
+					if (Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) unlinkSync(lockPath);
+				} catch {
+					/* lock vanished or is unreadable */
+				}
+				sleepSync(LOCK_RETRY_MS);
+			}
+		}
+		const settings = parseSettings();
+		if (!settings) throw new Error("settings.json is not valid JSON");
+		const tmp = `${settingsPath}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+		try {
+			writeFileSync(tmp, `${JSON.stringify(mutate(settings), null, 2)}\n`);
+			renameSync(tmp, settingsPath);
+		} catch (error) {
+			try {
+				unlinkSync(tmp);
+			} catch {
+				/* never created or already renamed */
+			}
+			throw error;
+		}
+	} finally {
+		if (lock !== undefined) {
+			try {
+				closeSync(lock);
+			} catch {
+				/* already closed */
+			}
+			try {
+				unlinkSync(lockPath);
+			} catch {
+				/* not held */
+			}
+		}
+	}
+}
+
 /** Persist `custom.sidebar`, preserving every other settings key. Returns false when the write fails. */
 export function writeConfig(config: Config): boolean {
 	try {
-		const settings = parseSettings();
-		if (!settings) return false;
-		const custom = { ...(settings.custom as Record<string, unknown> | undefined), sidebar: config };
-		writeFileSync(`${settingsPath}.tmp`, `${JSON.stringify({ ...settings, custom }, null, 2)}\n`);
-		renameSync(`${settingsPath}.tmp`, settingsPath);
+		updateSettings((settings) => ({ ...settings, custom: { ...(settings.custom as Record<string, unknown> | undefined), sidebar: config } }));
 		return true;
 	} catch {
 		return false;

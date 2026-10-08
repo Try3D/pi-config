@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { basename } from "node:path";
 import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { type PgStore, PgStore as PgStoreClass, trackerConnectionString } from "./store.ts";
+import { type PgStore, PgStore as PgStoreClass, pgErrorText, trackerConnectionString } from "./store.ts";
 
 /** Cap each string so oversized payloads stay queryable in Postgres. */
 const MAX_STRING_LENGTH = 20_000;
@@ -230,6 +230,41 @@ function parseExitCode(text: string | null): number | null {
 	return match?.[1] === undefined ? null : Number(match[1]);
 }
 
+const CONNECTION_ERROR_CODES = new Set([
+	"ECONNREFUSED",
+	"ECONNRESET",
+	"ETIMEDOUT",
+	"ENOTFOUND",
+	"EHOSTUNREACH",
+	"ENETUNREACH",
+	"EPIPE",
+	"EAI_AGAIN",
+]);
+
+/** True for socket/SQLSTATE failures where a reconnect may succeed. */
+function isConnectionError(error: unknown): boolean {
+	const code = field<string>(error, "code");
+	if (typeof code === "string" && (CONNECTION_ERROR_CODES.has(code) || code.startsWith("08") || code.startsWith("57P"))) {
+		return true;
+	}
+	const message = field<string>(error, "message");
+	return typeof message === "string" && /connection terminated|connection closed|client has already been closed|not connected|timeout exceeded/i.test(message);
+}
+
+const RESPONSE_HEADER_ALLOWLIST = new Set(["content-type", "x-request-id"]);
+
+/** Keep only benign response headers; provider headers can carry credentials. */
+function allowedResponseHeaders(headers: Record<string, string>): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [name, value] of Object.entries(headers)) {
+		const lower = name.toLowerCase();
+		if (RESPONSE_HEADER_ALLOWLIST.has(lower) || lower.includes("ratelimit") || lower.includes("rate-limit")) {
+			out[name] = value;
+		}
+	}
+	return out;
+}
+
 function toolResultInfo(
 	toolName: string,
 	isError: boolean,
@@ -271,8 +306,12 @@ export class Tracker {
 	private currentTurn: TurnState | null = null;
 	private turnSeq = 0;
 	private toolStarts = new Map<string, { startedAt: Date; name: string; args: unknown }>();
+	private ctx: ExtensionContext | null = null;
+	private stopping = false;
+	private reconnectLoop: Promise<PgStore | null> | null = null;
+	private wakeReconnect: (() => void) | null = null;
 
-	constructor(onError: (error: unknown) => void = (error) => console.error("[pi-pg-export]", error)) {
+	constructor(onError: (error: unknown) => void = (error) => console.error("[pi-pg-export]", pgErrorText(error))) {
 		this.onError = onError;
 	}
 
@@ -280,11 +319,16 @@ export class Tracker {
 		this.onError(error);
 	};
 
+	private handleError = (error: unknown): void => {
+		this.report(error);
+		if (isConnectionError(error)) this.scheduleReconnect();
+	};
+
 	private enqueue(work: (store: PgStore) => Promise<void>): void {
 		this.pending = this.pending
 			.then(() => this.ready)
 			.then((store) => (store ? work(store) : undefined))
-			.catch(this.report);
+			.catch(this.handleError);
 	}
 
 	start(event: SessionStartLike, ctx: ExtensionContext): void {
@@ -295,26 +339,19 @@ export class Tracker {
 		this.currentTurn = null;
 		this.turnSeq = 0;
 		this.toolStarts.clear();
+		this.ctx = ctx;
+		this.stopping = false;
+		this.reconnectLoop = null;
+		this.wakeReconnect = null;
 		this.pending = Promise.resolve();
 		this.ready = disabled() ? Promise.resolve(null) : this.bootstrap(event, ctx);
 	}
 
 	private async bootstrap(event: SessionStartLike, ctx: ExtensionContext): Promise<PgStore | null> {
-		let store: PgStore | undefined;
+		let store: PgStore | null = null;
 		try {
-			store = await PgStoreClass.connect(trackerConnectionString());
-			const cwd = ctx.cwd;
-			const slug = process.env.PI_TRACKER_PROJECT ?? basename(cwd) ?? "unknown";
-			this.projectId = await store.upsertProject(slug, cwd);
-			this.sessionId = await store.upsertSession({
-				id: ctx.sessionManager.getSessionId(),
-				fallbackId: randomUUID(),
-				projectId: this.projectId,
-				name: ctx.sessionManager.getSessionName(),
-				cwd,
-				file: ctx.sessionManager.getSessionFile(),
-				mode: ctx.mode,
-			});
+			store = await this.connectAndUpsert(ctx);
+			if (!store) return null;
 			this.turnSeq = await store.maxTurnSeq(this.sessionId);
 			await store.insertEvent({
 				sessionId: this.sessionId,
@@ -339,13 +376,78 @@ export class Tracker {
 			}
 			return store;
 		} catch (error) {
-			this.report(error);
 			if (store) await store.close().catch(() => undefined);
+			this.report(error);
+			if (isConnectionError(error)) this.scheduleReconnect();
 			return null;
 		}
 	}
 
+	private async connectAndUpsert(ctx: ExtensionContext): Promise<PgStore | null> {
+		const connectionString = trackerConnectionString();
+		if (!connectionString) return null;
+		const store = await PgStoreClass.connect(connectionString);
+		try {
+			const cwd = ctx.cwd;
+			const slug = process.env.PI_TRACKER_PROJECT ?? (basename(cwd) || "unknown");
+			this.projectId = await store.upsertProject(slug, cwd);
+			this.sessionId = await store.upsertSession({
+				id: ctx.sessionManager.getSessionId(),
+				fallbackId: randomUUID(),
+				projectId: this.projectId,
+				name: ctx.sessionManager.getSessionName(),
+				cwd,
+				file: ctx.sessionManager.getSessionFile(),
+				mode: ctx.mode,
+			});
+			return store;
+		} catch (error) {
+			await store.close().catch(() => undefined);
+			throw error;
+		}
+	}
+
+	private scheduleReconnect(): void {
+		if (this.reconnectLoop || this.stopping || disabled()) return;
+		console.error("[pi-pg-export] export degraded: database unavailable, retrying with backoff");
+		const loop = this.reconnectWithBackoff();
+		this.reconnectLoop = loop;
+		this.ready = loop;
+	}
+
+	private async reconnectWithBackoff(): Promise<PgStore | null> {
+		let delay = 1_000;
+		while (!this.stopping) {
+			await new Promise<void>((resolve) => {
+				const timer = setTimeout(resolve, delay);
+				this.wakeReconnect = () => {
+					clearTimeout(timer);
+					resolve();
+				};
+			});
+			this.wakeReconnect = null;
+			if (this.stopping) return null;
+			delay = Math.min(delay * 2, 60_000);
+			const ctx = this.ctx;
+			if (!ctx) return null;
+			try {
+				const store = await this.connectAndUpsert(ctx);
+				if (store) {
+					this.reconnectLoop = null;
+					console.error("[pi-pg-export] export recovered");
+					return store;
+				}
+				return null;
+			} catch (error) {
+				this.onError(error);
+			}
+		}
+		return null;
+	}
+
 	async stop(event: SessionShutdownLike, ctx: ExtensionContext): Promise<void> {
+		this.stopping = true;
+		this.wakeReconnect?.();
 		this.syncEntries(ctx);
 		this.record("session_shutdown", { reason: event.reason, targetSessionFile: event.targetSessionFile ?? null }, ctx);
 		if (this.sessionId) this.enqueue((store) => store.setSessionStatus(this.sessionId, "ended"));
@@ -364,9 +466,8 @@ export class Tracker {
 		const entries = ctx.sessionManager.getEntries();
 		entries.forEach((entry, index) => {
 			if (this.seenEntries.has(entry.id)) return;
-			this.seenEntries.add(entry.id);
-			this.enqueue((store) =>
-				store.insertEntry({
+			this.enqueue(async (store) => {
+				await store.insertEntry({
 					sessionId: this.sessionId,
 					entryId: entry.id,
 					parentId: entry.parentId,
@@ -375,8 +476,9 @@ export class Tracker {
 					role: entryRole(entry),
 					occurredAt: safeDate(entry.timestamp),
 					payload: entryPayload(entry),
-				}),
-			);
+				});
+				this.seenEntries.add(entry.id);
+			});
 		});
 	}
 
@@ -401,6 +503,7 @@ export class Tracker {
 		if (field<string>(message, "role") !== "assistant") return;
 		const stream = this.currentStream;
 		this.currentStream = null;
+		const turnId = this.currentTurn?.id ?? null;
 		const info = assistantInfo(message);
 		const startedAt = stream?.startedAt ?? (info.timestamp ? new Date(info.timestamp) : new Date());
 		const endedAt = new Date();
@@ -408,7 +511,7 @@ export class Tracker {
 			store.insertLlmCall({
 				id: randomUUID(),
 				sessionId: this.sessionId,
-				turnId: this.currentTurn?.id ?? null,
+				turnId,
 				provider: info.provider ?? "unknown",
 				model: info.model ?? "unknown",
 				streamed: stream !== undefined,
@@ -430,31 +533,38 @@ export class Tracker {
 	}
 
 	toolStart(event: ToolStartLike, _ctx: ExtensionContext): void {
-		this.toolStarts.set(event.toolCallId, { startedAt: new Date(), name: event.toolName, args: event.args });
+		this.toolStarts.set(event.toolCallId, {
+			startedAt: new Date(),
+			name: event.toolName,
+			args: sanitize(event.args, MAX_STRING_LENGTH),
+		});
 	}
 
 	toolEnd(event: ToolEndLike, _ctx: ExtensionContext): void {
 		const started = this.toolStarts.get(event.toolCallId);
 		this.toolStarts.delete(event.toolCallId);
 		if (this.currentTurn) this.currentTurn.toolCount += 1;
+		const turnId = this.currentTurn?.id ?? null;
 		const startedAt = started?.startedAt ?? new Date();
 		const endedAt = new Date();
 		const result = toolResultInfo(event.toolName, event.isError, event.result);
+		const output = sanitize(result.output, MAX_STRING_LENGTH) as string | null;
+		const details = sanitize(result.details, MAX_STRING_LENGTH);
 		this.enqueue((store) =>
 			store.insertToolCall({
 				id: randomUUID(),
 				sessionId: this.sessionId,
-				turnId: this.currentTurn?.id ?? null,
+				turnId,
 				toolCallId: event.toolCallId,
 				toolName: event.toolName,
 				args: started?.args ?? null,
-				output: result.output,
-				outputJson: result.details,
+				output,
+				outputJson: details,
 				isError: event.isError,
-				error: event.isError ? (result.details ?? result.output) : null,
+				error: event.isError ? (details ?? output) : null,
 				exitCode: result.exitCode,
 				durationMs: endedAt.getTime() - startedAt.getTime(),
-				details: result.details,
+				details,
 				startedAt,
 				endedAt,
 			}),
@@ -502,7 +612,7 @@ export class Tracker {
 	}
 
 	providerResponse(event: ProviderResponseLike, ctx: ExtensionContext): void {
-		this.record("provider_response", { status: event.status, headers: event.headers }, ctx);
+		this.record("provider_response", { status: event.status, headers: allowedResponseHeaders(event.headers) }, ctx);
 	}
 
 	providerRequest(event: ProviderRequestLike, ctx: ExtensionContext): void {

@@ -28,10 +28,10 @@ All optional environment variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PI_TRACKER_DATABASE_URL` | `postgres://pi_tracker:pi_tracker@localhost:5433/pi_tracker` | Postgres connection (also reads `DATABASE_URL`) |
+| `PI_TRACKER_DATABASE_URL` | (required) | Postgres connection; export is disabled when unset |
 | `PI_TRACKER_PROJECT` | basename of the session cwd | project slug |
-| `PI_TRACKER_PAYLOADS` | unset | when `1`, also store the full provider request payload per call (large) |
-| `PI_TRACKER_DISABLE` | unset | when `1`, load the extension but write nothing |
+| `PI_TRACKER_PAYLOADS` | unset | when truthy (`1`/`true`/`yes`), also store the full provider request payload per call (large) |
+| `PI_TRACKER_DISABLE` | unset | when truthy (`1`/`true`/`yes`), load the extension but write nothing |
 
 ## How it works
 

@@ -44,7 +44,7 @@ The extension installs the child hook (`child.ts`) only when
 - `message_end` (assistant) tracks the latest text and `stopReason`.
 - `agent_settled` writes `result.json` and arms the idle timer. The parent's
   watcher picks up the result and posts a notification.
-- `session_shutdown` writes a `failed` result if the run never settled.
+- `session_shutdown` writes a `failed` result only if a turn was still active.
 
 ```
 <runDir>/
@@ -64,8 +64,9 @@ need an exit sentinel.
   prompt, new turn, or blocking dialog restarts the timer. When the timer
   expires, pi exits and the pane closes. Set `PI_SUBAGENT_KEEPALIVE_MS` to
   change the timeout.
-- The parent returns when the first `result.json` appears. The live pane remains
-  available for reading or follow-up turns.
+- The tool already returned a run id; the parent's watcher posts the result from
+  the first `result.json`. The live pane remains available for reading or
+  follow-up turns.
 
 ## Resume
 
@@ -94,7 +95,7 @@ need an exit sentinel.
 pi-subagents/
   index.ts      # extension entry: child hook + `subagent` tool + command wiring
   child.ts      # child-side settle hook, keep-alive
-  run.ts        # run dir/run.json, launch command, wait, resume, list, open
+  run.ts        # run dir/run.json, launch command, resume, list, open
   shell.ts      # shell quoting + pi invocation resolution
   tmux.ts       # current-session window/pane management (open, kill)
   agents.ts     # agent definition discovery + frontmatter

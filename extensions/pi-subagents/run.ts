@@ -3,8 +3,8 @@
  * session in a tmux pane, and hand messages to and from it.
  *
  * Always background: the caller gets a run id immediately. The child hook
- * writes result.json for status and pastes its final result into the parent
- * pane when it settles; there is no parent-side watcher.
+ * writes result.json when it settles and a parent-side watcher posts the
+ * result as a follow-up notification.
  *
  * Parent -> child steering pastes into the child's live pane; Pi queues the
  * input as steering when the child is mid-turn. If the pane is gone the run is
@@ -68,6 +68,8 @@ interface ChildResult {
 	status: "done" | "failed";
 	text: string;
 	finishedAt: string;
+	/** Epoch ms when the settling turn started, so a pre-send result can be told apart. */
+	turnStartedAt?: number;
 }
 
 export interface RunSummary {
@@ -96,7 +98,7 @@ function runDirFor(runId: string): string {
 	return path.join(runsDir(), runId);
 }
 
-export function readJson<T>(filePath: string): T | null {
+function readJson<T>(filePath: string): T | null {
 	try {
 		// `lstat` rejects symlinks and non-regular files (e.g. a planted FIFO that
 		// would block the event loop on read).
@@ -126,6 +128,17 @@ function archiveResult(runDir: string): void {
 	if (!fs.existsSync(resultPath)) return;
 	try {
 		fs.renameSync(resultPath, path.join(runDir, `result.${Date.now()}.json`));
+	} catch {
+		/* best-effort */
+	}
+}
+
+/** Atomically record when a follow-up was sent so a pre-send result is not reported as the reply. */
+function writeSent(runDir: string): void {
+	const tmp = path.join(runDir, `sent.${process.pid}.json`);
+	try {
+		fs.writeFileSync(tmp, JSON.stringify({ sentAt: Date.now() }), { mode: 0o600 });
+		fs.renameSync(tmp, path.join(runDir, "sent.json"));
 	} catch {
 		/* best-effort */
 	}
@@ -222,7 +235,7 @@ function launchCommand(meta: RunMetadata, task: string): string {
 	if (meta.tools?.length) args.push("--tools", meta.tools.join(","));
 	if (meta.promptPath) args.push("--append-system-prompt", meta.promptPath);
 	// Empty when the pane is relaunched only to receive the pasted task as its prompt.
-	if (task) args.push(task);
+	if (task) args.push("--", task);
 
 	const runDir = runDirFor(meta.runId);
 	const argv = [invocation.command, ...args].map(shellQuote).join(" ");
@@ -284,6 +297,7 @@ export async function runSubagentBackground(options: {
 	const { ctx, agent, task, depth } = options;
 	const cwd = options.cwd ?? ctx.cwd;
 
+	if (!task.trim()) throw new Error("A task is required to start a subagent.");
 	assertTmux();
 	if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) {
 		throw new Error(`Subagent cwd does not exist or is not a directory: ${cwd}`);
@@ -340,8 +354,10 @@ export function sendToRun(options: { runId: string; task: string; depth: number 
 			throw new Error(`Subagent cwd does not exist or is not a directory: ${meta.cwd}`);
 		}
 
+		if (!task.trim()) throw new Error("A message is required.");
 		// A new message means new work: drop the old terminal result before sending.
 		archiveResult(runDir);
+		writeSent(runDir);
 		const existing = readPaneId(runDir);
 		let paneId: string | undefined;
 		if (existing && (await paneExists(existing))) {
@@ -377,9 +393,12 @@ export async function cancelSubagent(runId: string): Promise<void> {
 	const runDir = runDirFor(runId);
 	const meta = readJson<RunMetadata>(path.join(runDir, "run.json"));
 	if (!meta) throw new Error(`No subagent run found for "${runId}".`);
+	if (meta.runId !== runId) throw new Error(`Run metadata for "${runId}" is invalid.`);
 
 	const paneId = readPaneId(runDir);
 	if (paneId) await killPane(paneId);
+	// Preserve an already completed result rather than overwriting it with "Cancelled".
+	if (readJson<ChildResult>(path.join(runDir, "result.json"))) archiveResult(runDir);
 	const text = readStderrTail(runDir);
 	writeTerminalResult(runDir, "failed", text || "Cancelled");
 	stopBackgroundWatcher(runId);
@@ -413,7 +432,7 @@ const backgroundWatchers = new Map<string, NodeJS.Timeout>();
 
 function formatResultMessage(meta: RunMetadata, result: ChildResult, runDir: string): string {
 	const sections: string[] = [];
-	const text = typeof result.text === "string" ? result.text : readStderrTail(runDir);
+	const text = typeof result.text === "string" && result.text.trim() ? result.text : readStderrTail(runDir);
 	if (text.trim()) sections.push(text.trim());
 	// Best-effort; do not block the notification on git IO.
 	const changes = gitSummarySync(meta.cwd);
@@ -432,32 +451,67 @@ function gitSummarySync(cwd: string): string {
 	}
 }
 
+/** True when a result predates the most recent follow-up send (an old turn's settle). */
+function resultIsStale(result: ChildResult, sentAt: number | undefined): boolean {
+	if (typeof sentAt !== "number") return false;
+	return typeof result.turnStartedAt === "number" ? result.turnStartedAt < sentAt : Date.parse(result.finishedAt) < sentAt;
+}
+
 /** Watch a run's result.json and post a follow-up notification when it appears. */
 export function startBackgroundWatcher(pi: ExtensionAPI, runId: string): void {
 	if (backgroundWatchers.has(runId)) return;
 	const runDir = runDirFor(runId);
 	let paneMisses = 0;
+	let paneCheckInFlight = false;
+	const failOnDeadPane = (): void => {
+		stopBackgroundWatcher(runId);
+		const text = readStderrTail(runDir);
+		writeTerminalResult(runDir, "failed", text);
+		const meta = readJson<RunMetadata>(path.join(runDir, "run.json"));
+		if (meta) {
+			const reason = text.trim() ? `pane exited:\n${text}` : "pane exited before reporting a result";
+			pi.sendMessage(
+				{
+					customType: "pi-subagents",
+					content: `**${meta.agent}** failed: ${reason}`,
+					display: true,
+					details: { agent: meta.agent, runId, error: "pane exited" },
+				},
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+		}
+	};
 	const timer = setInterval(() => {
 		const result = readJson<ChildResult>(path.join(runDir, "result.json"));
 		if (result) {
-			stopBackgroundWatcher(runId);
-			const meta = readJson<RunMetadata>(path.join(runDir, "run.json"));
-			if (meta) {
-				pi.sendMessage(
-					{
-						customType: "pi-subagents",
-						content: formatResultMessage(meta, result, runDir),
-						display: true,
-						details: { agent: meta.agent, runId, status: result.status },
-					},
-					{ deliverAs: "followUp", triggerTurn: true },
-				);
+			const sent = readJson<{ sentAt?: number }>(path.join(runDir, "sent.json"));
+			if (resultIsStale(result, sent?.sentAt)) {
+				// A settle from before the last follow-up send: clear it and fall through
+				// to the pane check so we neither report it nor loop on it forever.
+				archiveResult(runDir);
+			} else {
+				stopBackgroundWatcher(runId);
+				const meta = readJson<RunMetadata>(path.join(runDir, "run.json"));
+				if (meta) {
+					pi.sendMessage(
+						{
+							customType: "pi-subagents",
+							content: formatResultMessage(meta, result, runDir),
+							display: true,
+							details: { agent: meta.agent, runId, status: result.status },
+						},
+						{ deliverAs: "followUp", triggerTurn: true },
+					);
+				}
+				return;
 			}
-			return;
 		}
+		if (paneCheckInFlight) return;
+		paneCheckInFlight = true;
 		const paneId = readPaneId(runDir);
-		if (!paneId) return;
-		void paneExists(paneId).then((exists) => {
+		void (paneId ? paneExists(paneId) : Promise.resolve(false)).then((exists) => {
+			paneCheckInFlight = false;
+			if (backgroundWatchers.get(runId) !== timer) return;
 			if (exists) {
 				paneMisses = 0;
 				return;
@@ -466,28 +520,13 @@ export function startBackgroundWatcher(pi: ExtensionAPI, runId: string): void {
 			// Require a few consecutive misses to avoid false alarms during tmux
 			// bookkeeping; a truly dead pane stays gone across ~1.2s of polls.
 			if (paneMisses < 3) return;
-			stopBackgroundWatcher(runId);
-			const text = readStderrTail(runDir);
-			writeTerminalResult(runDir, "failed", text);
-			const meta = readJson<RunMetadata>(path.join(runDir, "run.json"));
-			if (meta) {
-				const reason = text.trim() ? `pane exited:\n${text}` : "pane exited before reporting a result";
-				pi.sendMessage(
-					{
-						customType: "pi-subagents",
-						content: `**${meta.agent}** failed: ${reason}`,
-						display: true,
-						details: { agent: meta.agent, runId, error: "pane exited" },
-					},
-					{ deliverAs: "followUp", triggerTurn: true },
-				);
-			}
+			failOnDeadPane();
 		});
 	}, POLL_MS);
 	backgroundWatchers.set(runId, timer);
 }
 
-export function stopBackgroundWatcher(runId: string): void {
+function stopBackgroundWatcher(runId: string): void {
 	const timer = backgroundWatchers.get(runId);
 	if (timer) {
 		clearInterval(timer);

@@ -4,7 +4,9 @@ A docked process panel that reflows the Pi transcript instead of covering it.
 
 Pi's TUI has no sidebar region, so in fullscreen mode this wraps the renderer's
 layout root in an `HStack`: `[ transcript + dock | sidebar ]`. Toggling the
-sidebar resizes the transcript rather than overlaying it.
+sidebar resizes the transcript rather than overlaying it. Outside fullscreen
+mode there is no layout root to wrap, so regular mode falls back to a
+content-covering overlay; use fullscreen mode for docking.
 
 ## Install
 

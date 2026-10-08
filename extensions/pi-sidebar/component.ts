@@ -140,14 +140,20 @@ export class SidebarComponent implements Component {
 			const glyph = item.streaming ? spinner : depth === 0 ? INACTIVE_MARKER : SUBAGENT_MARKER;
 			const tone = item.current ? "accent" : item.streaming ? "text" : "dim";
 			const glyphText = theme.fg(tone, glyph);
-			const tabText = tab ? theme.fg("dim", tab) : "";
+			let tabText = tab ? theme.fg("dim", tab) : "";
 			const elapsedText = theme.fg("dim", item.elapsed);
 			// Appended once the process's last action finished; cleared when it runs again
 			// and never shown on the current row, since you are already looking at it.
-			const doneText = item.done && !item.current ? theme.fg("success", DONE_MARKER) : "";
-			// Reserve everything but the label so the elapsed time is never clipped.
-			const overhead = visibleWidth(head) + visibleWidth(glyphText) + 1 + visibleWidth(tabText) + 1 + visibleWidth(elapsedText) + (doneText ? visibleWidth(doneText) + 1 : 0);
-			const available = Math.max(1, Math.min(this.labelWidth(), inner - 1 - overhead));
+			let doneText = item.done && !item.current ? theme.fg("success", DONE_MARKER) : "";
+			// Reserve everything but the label so the elapsed time is never clipped. When
+			// even the label cannot fit, drop the optional columns instead of clipping it.
+			let overhead = visibleWidth(head) + visibleWidth(glyphText) + 1 + visibleWidth(tabText) + 1 + visibleWidth(elapsedText) + (doneText ? visibleWidth(doneText) + 1 : 0);
+			if (overhead >= inner - 1) {
+				tabText = "";
+				doneText = "";
+				overhead = visibleWidth(head) + visibleWidth(glyphText) + 1 + 1 + visibleWidth(elapsedText);
+			}
+			const available = Math.max(0, Math.min(this.labelWidth(), inner - 1 - overhead));
 			const limited = truncateToWidth(item.label, available, "…");
 			const name = item.current ? theme.fg("accent", limited) : theme.fg("text", limited);
 			this.rowPids.set(body.length, item.pid);
