@@ -486,8 +486,8 @@ export function startBackgroundWatcher(pi: ExtensionAPI, runId: string): void {
 		if (result) {
 			const sent = readJson<{ sentAt?: number }>(path.join(runDir, "sent.json"));
 			if (resultIsStale(result, sent?.sentAt)) {
-				// A settle from before the last follow-up send: clear it and fall through
-				// to the pane check so we neither report it nor loop on it forever.
+				// This settle happened before the last follow-up send. Clear it and fall
+				// through to the pane check so we neither report it nor loop on it forever.
 				archiveResult(runDir);
 			} else {
 				stopBackgroundWatcher(runId);

@@ -6,7 +6,7 @@ Each subagent runs an interactive `pi` session in its own tmux window (tab).
 The window is added at the end and named `_1`, `_2`, `_3`, and so on. The pane
 shows the full TUI.
 
-Subagents run in the background: the parent gets a `run_id`
+Subagents run in the background. The parent gets a `run_id`
 immediately and a follow-up notification when the agent completes. The pane
 stays open for 10 minutes after each settle so you can read or steer it. A
 keystroke, submitted prompt, new turn, or blocking dialog restarts the timer.
@@ -30,7 +30,7 @@ LLM-facing tool:
 ```text
 subagent({ task: "find the auth flow" })
 // defaults to the built-in general agent; returns a run_id immediately;
-// you are notified when it settles (result.json + parent watcher)
+// you are notified when it settles, from result.json via the parent watcher
 
 subagent({ agent: "scout", task: "find the auth flow" })
 // use a named agent definition

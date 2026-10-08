@@ -3,7 +3,7 @@
  * - agent_settled: "finished" when pi will not continue automatically
  * - ui_prompt_start: "needs attention" when a blocking prompt appears
  *
- * Subagent panes do not send the "finished" notification: when
+ * Subagent panes do not send the "finished" notification. When
  * PI_SUBAGENT_RUN_DIR is set and the session id matches the run dir, the parent
  * reports each result, so a notification per run would be redundant. Prompts
  * still notify because they block.

@@ -4,7 +4,7 @@ const { Client } = pg;
 
 let warnedMissingConnection = false;
 
-/** Export is opt-in: without an explicit URL the tracker stays disabled. */
+/** Export requires an explicit URL; without one the tracker stays disabled. */
 export function trackerConnectionString(): string | null {
 	const url = process.env.PI_TRACKER_DATABASE_URL;
 	if (!url) {

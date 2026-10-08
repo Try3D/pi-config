@@ -461,7 +461,7 @@ export default function (pi: ExtensionAPI) {
 
 		// Match the executable (the first args token) rather than the whole command
 		// line, so `grep pi` or an editor opening a pi file is not a pi process. The
-		// comm column is not used: macOS reports it as a whitespace-containing path.
+		// comm column is not used because macOS reports it as a whitespace-containing path.
 		const rows = parsed.filter((row) => {
 			const args = row.args.trim();
 			const command = args.split(/\s+/, 1)[0] ?? "";

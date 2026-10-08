@@ -25,12 +25,12 @@ export interface Config {
 
 const agentDir = dirname(SHARED_DIR);
 export const settingsPath = join(agentDir, "settings.json");
-// Deliberately NOT `settings.json.lock`: pi core locks that exact path as a
+// Deliberately not `settings.json.lock`. Pi core locks that exact path as a
 // directory via proper-lockfile, so a regular file there would break its writes.
 const lockPath = `${settingsPath}.pi-config.lock`;
 const LOCK_RETRIES = 50;
 const LOCK_RETRY_MS = 20;
-/** A lock older than this was left by a hard kill: the critical section is a fast read+write. */
+/** A lock older than this was left by a hard kill, since the critical section is a fast read and write. */
 const LOCK_STALE_MS = 10_000;
 
 /** Coerce a value to a usable column count. */
@@ -68,7 +68,7 @@ const sleepSync = (ms: number): void => {
 /**
  * Read-modify-write the settings file under an exclusive lock so concurrent
  * writers cannot clobber each other, writing to a unique temp file and renaming
- * it into place. The lock is released even when the write fails.
+ * it into place. The function releases the lock even when the write fails.
  */
 function updateSettings(mutate: (settings: Record<string, unknown>) => Record<string, unknown>): void {
 	let lock: number | undefined;

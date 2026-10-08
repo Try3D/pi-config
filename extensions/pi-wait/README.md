@@ -24,4 +24,4 @@ Durations take an optional unit and default to seconds: `30`, `5s`, `5m`, `1h`,
 `500ms`. The maximum is 24h.
 
 If the agent is busy when you queue the wait, the countdown starts once it
-settles. The pending wait survives `/reload` and is restored from the session.
+settles. The pending wait survives `/reload`, and the extension restores it from the session.

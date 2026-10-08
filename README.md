@@ -9,7 +9,7 @@ Extensions for the [Pi coding agent](https://pi.dev).
 | [pi-title](extensions/pi-title/README.md) | Generates session titles from the first exchange (`/title`) |
 | [pi-notify](extensions/pi-notify/README.md) | macOS notifications when a session finishes or needs attention |
 | [pi-pg-export](extensions/pi-pg-export/README.md) | Exports interactive pi sessions to Postgres for auditability |
-| [pi-mood](extensions/pi-mood/README.md) | Experimental footer mascot picked by a System One classifier (future-deprecated) |
+| [pi-mood](extensions/pi-mood/README.md) | Experimental footer mascot picked by a System One classifier; may be removed later |
 | [pi-wait](extensions/pi-wait/README.md) | Queues a prompt after a delay with `/wait` |
 
 ## Install

@@ -35,7 +35,7 @@ Commands:
 ## Configuration
 
 Config lives under `custom.title` in `~/.pi/agent/settings.json` (honoring
-`PI_CODING_AGENT_DIR`), and is read at session start:
+`PI_CODING_AGENT_DIR`). The extension reads it at session start:
 
 | Key | Default | Purpose |
 |---|---|---|
