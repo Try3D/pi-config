@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/knip/schema.json",
-  "entry": ["extensions/*/index.ts", "scripts/*.mjs"],
-  "project": ["extensions/**/*.ts", "scripts/**/*.mjs"],
+  "entry": ["extensions/*/index.ts"],
+  "project": ["extensions/**/*.ts"],
   "ignoreBinaries": ["osascript"]
 }
