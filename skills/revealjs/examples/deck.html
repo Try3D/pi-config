@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+
+    <title>Postgres vs ClickHouse</title>
+
+    <!-- Stock links from the clone. Order matters: reveal.css before the stylesheet. -->
+    <link rel="stylesheet" href="dist/reset.css" />
+    <link rel="stylesheet" href="dist/reveal.css" />
+    <link rel="stylesheet" href="dist/theme/black.css" />
+    <link rel="stylesheet" href="dist/plugin/highlight/monokai.css" />
+
+    <!-- The entire style kit. Nothing here that a slide below does not use. -->
+    <style>
+      :root { --accent: #42affa; }
+
+      .reveal h1, .reveal h2, .reveal h3 { text-transform: none; }
+      .reveal h2 { color: var(--accent); }
+      .reveal strong { color: var(--accent); }
+
+      .cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 40px; text-align: left; }
+      .cols h3 { margin-top: 0; font-size: 0.8em; }
+      .cols svg { width: 48px; height: 48px; stroke: var(--accent); fill: none; stroke-width: 1.5; }
+    </style>
+  </head>
+  <body>
+    <div class="reveal">
+      <div class="slides">
+
+        <!-- Title -->
+        <section id="title">
+          <h1>Postgres vs ClickHouse</h1>
+          <p>Picking a store for analytics workloads</p>
+          <aside class="notes">Frame this as a workload question, not a winner question. Nobody is replacing Postgres wholesale.</aside>
+        </section>
+
+        <!-- Section divider: dark background, heading only -->
+        <section id="part-storage" data-background-color="#1a1a1a">
+          <h2>Storage</h2>
+        </section>
+
+        <!-- Three columns with icons -->
+        <section id="storage">
+          <h2>Storage model</h2>
+          <div class="cols">
+            <div>
+              <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+              <h3>Row store</h3>
+              <p>Whole rows together. Fast single-record reads and writes.</p>
+            </div>
+            <div>
+              <svg viewBox="0 0 24 24"><path d="M6 4v16M12 4v16M18 4v16"/></svg>
+              <h3>Column store</h3>
+              <p>One column together. Fast scans over a few fields.</p>
+            </div>
+            <div>
+              <svg viewBox="0 0 24 24"><path d="M4 18l6-8 4 5 6-9"/></svg>
+              <h3>Consequence</h3>
+              <p>The storage choice picks the workload for you.</p>
+            </div>
+          </div>
+          <aside class="notes">This single decision explains almost everything that follows. Don't rush it.</aside>
+        </section>
+
+        <!-- One statement carrying the slide -->
+        <section id="scan">
+          <h2 class="r-fit-text">40x fewer bytes</h2>
+          <p>Same query, same data, columnar layout.</p>
+          <aside class="notes">Numbers vary by schema. The order of magnitude is the point.</aside>
+        </section>
+
+        <!-- Code -->
+        <section id="query">
+          <h2>The query that decides it</h2>
+          <pre><code class="language-sql" data-trim data-line-numbers="1|2-4">
+            SELECT toStartOfHour(ts) AS h, count()
+            FROM events
+            WHERE ts > now() - INTERVAL 7 DAY
+            GROUP BY h
+          </code></pre>
+          <aside class="notes">Touches two columns across a week. Row storage reads every column to answer it.</aside>
+        </section>
+
+        <!-- Bullets, with a fragment where the sequence matters -->
+        <section id="writes">
+          <h2>Write path</h2>
+          <ul>
+            <li>Row inserts, one at a time — <strong>Postgres</strong></li>
+            <li>Batched inserts, thousands at a time — <strong>ClickHouse</strong></li>
+            <li class="fragment">Small frequent writes are the failure mode</li>
+          </ul>
+          <aside class="notes">Hold the third line back — it's the thing teams get wrong first.</aside>
+        </section>
+
+        <!-- Vertical stack: optional detail, not the main thread -->
+        <section>
+          <section id="txn">
+            <h2>Transactions</h2>
+            <p>Where the two genuinely diverge.</p>
+            <aside class="notes">Press down if anyone asks for specifics.</aside>
+          </section>
+          <section id="txn-pg">
+            <h3>Postgres</h3>
+            <p>Full ACID, per statement, across tables.</p>
+          </section>
+          <section id="txn-ch">
+            <h3>ClickHouse</h3>
+            <p>Atomic per insert. No cross-table transactions.</p>
+          </section>
+        </section>
+
+        <!-- Table for a comparison too long for columns -->
+        <section id="compare">
+          <h2>Side by side</h2>
+          <table>
+            <thead><tr><th></th><th>Postgres</th><th>ClickHouse</th></tr></thead>
+            <tbody>
+              <tr><td>Layout</td><td>Row</td><td>Column</td></tr>
+              <tr><td>Writes</td><td>Single row</td><td>Batched</td></tr>
+              <tr><td>Transactions</td><td>Full ACID</td><td>Limited</td></tr>
+              <tr><td>Joins</td><td>Strong</td><td>Workable, not free</td></tr>
+            </tbody>
+          </table>
+        </section>
+
+        <!-- Close: the actual recommendation, not a "Key Takeaways" slide -->
+        <section id="close">
+          <h2>How to choose</h2>
+          <ul>
+            <li>Serving individual records — <strong>Postgres</strong></li>
+            <li>Aggregating over billions of rows — <strong>ClickHouse</strong></li>
+            <li>Both, usually — Postgres for state, ClickHouse for analytics</li>
+          </ul>
+          <aside class="notes">Land on "both". Most teams here already run Postgres and are adding, not migrating.</aside>
+        </section>
+
+      </div>
+    </div>
+
+    <script src="dist/reveal.js"></script>
+    <script src="dist/plugin/notes.js"></script>
+    <script src="dist/plugin/markdown.js"></script>
+    <script src="dist/plugin/highlight.js"></script>
+    <script>
+      Reveal.initialize({
+        hash: true,
+        plugins: [RevealMarkdown, RevealHighlight, RevealNotes],
+      });
+    </script>
+  </body>
+</html>
