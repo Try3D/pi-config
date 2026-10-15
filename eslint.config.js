@@ -18,10 +18,24 @@ export default tseslint.config(
 		},
 	},
 	{
-		files: ["**/*.mjs"],
+		files: ["**/*.mjs", "**/*.cjs"],
 		languageOptions: {
-			globals: { console: "readonly", fetch: "readonly", process: "readonly", setTimeout: "readonly", URL: "readonly" },
+			globals: {
+		commonjs: "readonly",
+				console: "readonly",
+				fetch: "readonly",
+				module: "readonly",
+				process: "readonly",
+				require: "readonly",
+				setTimeout: "readonly",
+				URL: "readonly",
+				__dirname: "readonly",
+			},
 		},
-		rules: tseslint.configs.disableTypeChecked.rules,
+		rules: {
+			...tseslint.configs.disableTypeChecked.rules,
+			"@typescript-eslint/no-require-imports": "off",
+			"no-undef": "off",
+		},
 	},
 );
